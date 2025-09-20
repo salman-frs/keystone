@@ -1,240 +1,430 @@
 # Getting Started
 
-This guide helps you get up and running with the Keystone Security Platform after completing the initial setup.
+This guide covers prerequisite installation and basic workflows for the Keystone Security Platform after completing the initial setup from the [Setup Guide](setup.md).
 
 ## First Steps
 
-### 1. Verify Installation
+### 1. Verify Prerequisites Installation
 
-Ensure all services are running:
-
-```bash
-# Check service status
-docker-compose ps
-
-# Verify API connectivity
-curl http://localhost:8080/health
-
-# Access dashboard
-open http://localhost:3000
-```
-
-### 2. Basic Configuration
-
-The platform uses configuration files for different environments:
+Ensure all prerequisite tools are properly installed:
 
 ```bash
-# Development configuration
-./infrastructure/policies/dev/
+# Verify Go installation (required: 1.21+)
+go version
 
-# Staging configuration  
-./infrastructure/policies/staging/
+# Verify GitHub CLI authentication
+gh auth status
 
-# Production configuration
-./infrastructure/policies/prod/
+# Verify Docker via Colima
+docker --version
+colima status
+
+# Verify security tools
+trivy --version
+grype version
+syft version
+cosign version
 ```
 
-## Core Concepts
+### 2. GitHub Authentication Setup
 
-### Vulnerability Correlation
-
-Keystone aggregates vulnerability data from multiple scanners:
-
-- **Trivy**: Container and filesystem scanning
-- **Grype**: Package vulnerability detection  
-- **Snyk**: Dependency vulnerability analysis
-
-### Policy Enforcement
-
-Security policies are defined using Open Policy Agent (OPA):
-
-```rego
-# Example policy: infrastructure/policies/dev/basic-security.rego
-package security
-
-deny[msg] {
-    input.vulnerabilities[_].severity == "CRITICAL"
-    msg := "Critical vulnerabilities detected"
-}
-```
-
-### Cryptographic Attestation
-
-All security artifacts are signed using Sigstore:
-
-- SBOM attestations
-- Scan result signatures
-- Policy compliance records
-
-## Basic Workflows
-
-### 1. Security Scanning
+Configure GitHub CLI for repository access and API integration:
 
 ```bash
-# Manual scan (development)
-./scripts/scan.sh
+# Login to GitHub (if not already done)
+gh auth login
 
-# View results in dashboard
-open http://localhost:3000/vulnerabilities
+# Select authentication method: Browser or Token
+# Choose: HTTPS protocol
+# Authorize GitHub CLI for repository access
+
+# Verify access to Keystone repository
+gh repo view salman-frs/keystone
+
+# Test API access
+gh api user
 ```
 
-### 2. Policy Evaluation  
+### 3. Install Kind (Kubernetes in Docker)
+
+Optional: Install kind for container orchestration testing:
 
 ```bash
-# Test policy against scan results
-./scripts/policy-check.sh ./examples/scan-results.json
+# Install kind via Homebrew
+brew install kind
 
-# View policy status
-open http://localhost:3000/policies
+# Verify installation
+kind version
+
+# Create test cluster (optional)
+kind create cluster --name keystone-test
+
+# Check cluster status
+kubectl cluster-info --context kind-keystone-test
+
+# Clean up test cluster
+kind delete cluster --name keystone-test
 ```
 
-### 3. Attestation Generation
+### 4. Node.js and Go Development Environment
+
+Ensure development tools are properly configured:
 
 ```bash
-# Generate and sign attestation
-./scripts/attest.sh
+# Verify Go installation and workspace
+go version
+go env GOPATH
+go env GOROOT
 
-# Verify attestation
-./scripts/verify.sh
+# Install Node.js (for future dashboard development)
+brew install node@18
+
+# Verify Node.js installation
+node --version
+npm --version
+
+# Optional: Install development tools
+npm install -g typescript
+npm install -g @types/node
 ```
 
-## Dashboard Navigation
+## Core Security Components (Implemented)
 
-### Security Overview
+### Multi-Scanner Vulnerability Detection
 
-- **Dashboard Home**: High-level security metrics
-- **Vulnerabilities**: Detailed vulnerability analysis
-- **Policies**: Policy compliance status
-- **Attestations**: Cryptographic verification records
+Keystone integrates multiple vulnerability scanners for comprehensive coverage:
 
-### Real-time Updates
+- **Trivy**: Container, filesystem, and dependency scanning with CVE database
+- **Grype**: Package vulnerability detection with anchore database
+- **Correlation Framework**: Capability to compare and merge findings from multiple scanners
 
-The dashboard provides live updates via Server-Sent Events:
+### SBOM Generation and Management
 
-- Scan progress notifications
-- Policy evaluation results
-- Remediation recommendations
+Software Bill of Materials (SBOM) creation using industry-standard formats:
 
-## Example Scenarios
+- **Syft Integration**: Generates SPDX and CycloneDX format SBOMs
+- **Artifact Storage**: GitHub Container Registry for secure SBOM storage
+- **Validation Workflows**: Automated SBOM content verification
 
-### Scenario 1: Container Security Scan
+### GitHub Actions Security Pipeline
+
+Automated security workflows integrated into CI/CD:
+
+- **Trigger Events**: Push, pull request, and release events
+- **Scanner Execution**: Parallel vulnerability scanning with multiple tools
+- **Artifact Management**: Automated upload to GitHub Container Registry
+- **Workflow Validation**: Testing scripts for local development
+
+### Future Components (Planned)
+
+- **Policy Enforcement**: Open Policy Agent (OPA) integration for security policies
+- **Cryptographic Attestation**: Sigstore keyless signing for supply chain security
+- **Real-time Dashboard**: React-based security visualization interface
+
+## Basic Workflows (Current Implementation)
+
+### 1. Manual Vulnerability Scanning
 
 ```bash
-# Build demo container
+# Scan vulnerable demo application with Trivy
+trivy fs examples/vulnerable-app/ --format json --output scanner-test-output/trivy-manual.json
+
+# Scan with Grype
+grype examples/vulnerable-app/ -o json > scanner-test-output/grype-manual.json
+
+# View scan results
+cat scanner-test-output/trivy-manual.json | jq '.Results[].Vulnerabilities | length'
+cat scanner-test-output/grype-manual.json | jq '.matches | length'
+```
+
+### 2. SBOM Generation Workflow
+
+```bash
+# Generate SPDX format SBOM
+syft examples/vulnerable-app/ -o spdx-json=sbom-test-output/manual-spdx.json
+
+# Generate CycloneDX format SBOM
+syft examples/vulnerable-app/ -o cyclonedx-json=sbom-test-output/manual-cyclonedx.json
+
+# Validate SBOM content
+cat sbom-test-output/manual-spdx.json | jq '.packages[].name'
+cat sbom-test-output/manual-cyclonedx.json | jq '.components[].name'
+```
+
+### 3. Automated Workflow Testing
+
+```bash
+# Run comprehensive workflow validation
+./scripts/setup/test-workflow.sh
+
+# Test individual components
+./scripts/setup/validate-scanners.sh
+./scripts/setup/test-sbom-workflow.sh
+./scripts/setup/test-vulnerable-app.sh
+```
+
+### 4. GitHub Actions Integration
+
+```bash
+# View workflow configuration
+cat .github/workflows/security-pipeline.yaml
+
+# Test workflow locally (if act is installed)
+brew install act
+act push
+
+# Monitor workflow runs
+gh run list
+gh run view [run-id]
+```
+
+## Security Tool Configuration
+
+### Trivy Configuration
+
+Trivy scans containers, filesystems, and dependencies:
+
+```bash
+# Update Trivy vulnerability database
+trivy image --download-db-only
+
+# Scan with specific severity levels
+trivy fs examples/vulnerable-app/ --severity HIGH,CRITICAL
+
+# Generate detailed JSON report
+trivy fs examples/vulnerable-app/ --format json --output detailed-trivy.json
+
+# View database info
+trivy --cache-dir ~/.cache/trivy version
+```
+
+### Grype Configuration
+
+Grype focuses on package vulnerability detection:
+
+```bash
+# Update Grype vulnerability database
+grype db update
+
+# Scan with output formatting
+grype examples/vulnerable-app/ -o table
+grype examples/vulnerable-app/ -o json
+
+# Check database status
+grype db status
+```
+
+### Syft Configuration
+
+Syft generates software bill of materials:
+
+```bash
+# List available output formats
+syft --help | grep -A 10 "output formats"
+
+# Generate with specific cataloger
+syft examples/vulnerable-app/ --catalogers go-module
+
+# Include file metadata
+syft examples/vulnerable-app/ -o spdx-json --file-metadata
+```
+
+## Practical Security Scenarios
+
+### Scenario 1: Vulnerable Application Analysis
+
+```bash
+# Build and scan vulnerable demo application
 cd examples/vulnerable-app
-docker build -t demo-app .
-
-# Scan with Keystone
+go build -o vulnerable-app .
 cd ../..
-./scripts/scan.sh demo-app
 
-# Review results in dashboard
+# Multi-scanner analysis
+trivy fs examples/vulnerable-app/ --format json > analysis-trivy.json
+grype examples/vulnerable-app/ -o json > analysis-grype.json
+
+# Compare vulnerability findings
+cat analysis-trivy.json | jq '.Results[].Vulnerabilities[].VulnerabilityID' | sort | uniq
+cat analysis-grype.json | jq '.matches[].vulnerability.id' | sort | uniq
 ```
 
-### Scenario 2: Policy Development
+### Scenario 2: SBOM Generation and Validation
 
 ```bash
-# Create custom policy
-cp infrastructure/policies/templates/basic-security.rego \
-   infrastructure/policies/dev/custom-policy.rego
+# Generate comprehensive SBOM
+syft examples/vulnerable-app/ -o cyclonedx-json=comprehensive-sbom.json
 
-# Edit policy rules
-vim infrastructure/policies/dev/custom-policy.rego
+# Validate SBOM structure
+cat comprehensive-sbom.json | jq 'keys'
+cat comprehensive-sbom.json | jq '.components | length'
+cat comprehensive-sbom.json | jq '.components[].name'
 
-# Test policy
-./scripts/policy-test.sh
+# Check for Go dependencies
+cat comprehensive-sbom.json | jq '.components[] | select(.type=="library") | .name'
 ```
 
-### Scenario 3: CI/CD Integration
+### Scenario 3: CI/CD Pipeline Integration
 
 ```bash
-# Add to GitHub Actions workflow
-cat >> .github/workflows/security.yml << EOF
-- name: Keystone Security Scan
-  uses: ./
-  with:
-    scan-target: \${{ github.workspace }}
-    policy-path: infrastructure/policies/prod/
+# Examine GitHub Actions workflow
+cat .github/workflows/security-pipeline.yaml
+
+# Test workflow components locally
+./scripts/setup/validate-scanners.sh
+./scripts/setup/test-sbom-workflow.sh
+
+# View workflow run history (if repository has actions)
+gh run list --workflow=security-pipeline.yaml
+```
+
+### Scenario 4: Development Workflow Integration
+
+```bash
+# Pre-commit security check
+./scripts/setup/test-vulnerable-app.sh
+
+# Continuous monitoring setup
+watch -n 30 './scripts/setup/validate-scanners.sh'
+
+# Integration with development tools
+go mod tidy examples/vulnerable-app/
+trivy fs examples/vulnerable-app/ --exit-code 1 --severity HIGH,CRITICAL
+```
+
+## Environment Configuration
+
+### GitHub Integration Variables
+
+```bash
+# Required for GitHub Actions integration
+export GITHUB_TOKEN="your-personal-access-token"
+
+# Optional: Repository configuration
+export GITHUB_REPOSITORY="salman-frs/keystone"
+export GITHUB_REF="refs/heads/main"
+
+# Verify environment
+echo "Token: ${GITHUB_TOKEN:0:10}..."
+gh auth status
+```
+
+### Scanner Configuration Files
+
+Create custom configuration files for enhanced scanning:
+
+```bash
+# Trivy configuration (optional)
+cat > .trivyignore << EOF
+# Ignore specific CVEs (example)
+CVE-2023-12345
+EOF
+
+# Grype configuration (optional)
+cat > .grype.yaml << EOF
+# Grype configuration
+output: json
+fail-on-severity: high
 EOF
 ```
 
-## Configuration Reference
-
-### Environment Variables
+### Directory Structure Configuration
 
 ```bash
-# API Configuration
-KEYSTONE_API_PORT=8080
-KEYSTONE_DATABASE_PATH=./data/keystone.db
+# Ensure output directories exist
+mkdir -p scanner-test-output
+mkdir -p sbom-test-output
 
-# Dashboard Configuration  
-VITE_API_URL=http://localhost:8080
-VITE_ENVIRONMENT=development
-
-# GitHub Integration
-GITHUB_TOKEN=<your-token>
-GITHUB_CLIENT_ID=<oauth-client-id>
-```
-
-### Policy Configuration
-
-```yaml
-# infrastructure/policies/config.yaml
-scanners:
-  trivy:
-    enabled: true
-    config: ./trivy.yaml
-  grype:
-    enabled: true
-    config: ./grype.yaml
-
-thresholds:
-  critical: 0
-  high: 5
-  medium: 20
+# Set proper permissions
+chmod 755 scanner-test-output sbom-test-output
+chmod +x scripts/setup/*.sh
 ```
 
 ## Troubleshooting
 
-### Common Issues
+### Scanner Issues
 
-**Scan failures:**
+**Trivy database update failures:**
 ```bash
-# Check scanner logs
-docker-compose logs api
+# Clear Trivy cache and update
+rm -rf ~/.cache/trivy
+trivy image --download-db-only
 
-# Verify scanner configuration
-./scripts/verify-scanners.sh
+# Check database status
+trivy --version
 ```
 
-**Policy evaluation errors:**
+**Grype database issues:**
 ```bash
-# Validate policy syntax
-opa fmt infrastructure/policies/dev/*.rego
+# Update Grype database
+grype db update
 
-# Test policy evaluation
-opa eval -d infrastructure/policies/dev/ "data.security.deny"
+# Check database status
+grype db status
+
+# Reset database if corrupted
+rm -rf ~/.grype
+grype db update
 ```
 
-**Dashboard connection issues:**
+**Syft SBOM generation failures:**
 ```bash
-# Check API connectivity
-curl -v http://localhost:8080/api/v1/health
+# Verify target directory exists
+ls -la examples/vulnerable-app/
 
-# Verify environment configuration
-cat apps/dashboard/.env.local
+# Test with verbose output
+syft examples/vulnerable-app/ -v
+
+# Check supported formats
+syft --help | grep -A 5 "output formats"
+```
+
+### GitHub Actions Integration Issues
+
+**Workflow permission errors:**
+```bash
+# Check repository permissions
+gh api repos/salman-frs/keystone --jq '.permissions'
+
+# Verify GitHub token scopes
+gh auth token | gh api graphql -f query='query { viewer { login } }'
+```
+
+**Local workflow testing issues:**
+```bash
+# Install act for local testing
+brew install act
+
+# Test workflow with act
+act -l  # List available actions
+act push -n  # Dry run
 ```
 
 ## Next Steps
 
-1. **Explore Examples**: Review [examples/](../examples/) directory
-2. **API Integration**: Read [API Documentation](api/)
-3. **Production Deployment**: Follow [Deployment Guide](deployment/)
-4. **Security Model**: Understand [Security Architecture](security/)
+1. **Run Demo Workflow**: Execute [Demo Guide](demo.md) for complete vulnerability detection demonstration
+2. **Explore Architecture**: Review [Architecture Overview](architecture.md) with system diagrams
+3. **Study Examples**: Examine vulnerable application in `examples/vulnerable-app/`
+4. **Configure CI/CD**: Understand GitHub Actions workflow in `.github/workflows/security-pipeline.yaml`
+5. **Review Validation Scripts**: Study testing scripts in `scripts/setup/`
+
+## Verification Checklist
+
+Confirm successful setup completion:
+
+- [ ] Go 1.21+ installed and verified
+- [ ] GitHub CLI authenticated and tested
+- [ ] Colima running with Docker functionality
+- [ ] Trivy, Grype, Syft, and Cosign installed
+- [ ] Repository cloned and directory structure verified
+- [ ] Vulnerable application builds successfully
+- [ ] Scanner validation scripts execute without errors
+- [ ] SBOM generation produces valid output
+- [ ] GitHub Actions workflow structure reviewed
 
 ## Additional Resources
 
-- [Troubleshooting Guide](troubleshooting.md)
-- [Contributing Guidelines](contributing.md)
-- [API Reference](api/)
-- [Examples and Tutorials](examples/)
+- **[Demo Guide](demo.md)**: Step-by-step vulnerability detection workflow
+- **[Architecture Overview](architecture.md)**: System design and component relationships
+- **[Troubleshooting Guide](troubleshooting.md)**: Common issues and solutions
+- **[API Documentation](api/)**: Future API specifications
+- **[Security Model](security/)**: Threat model and compliance framework

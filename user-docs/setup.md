@@ -1,43 +1,96 @@
 # Setup Guide
 
-This guide walks you through setting up the Keystone Security Platform for local development.
+This guide provides complete macOS setup instructions for the Keystone Security Platform local development environment.
 
 ## Prerequisites
 
 ### Required Software
 
-- **Go 1.25+**: High-performance backend services
-- **Node.js 22+**: Frontend dashboard development  
-- **Docker**: Container runtime (Colima recommended for macOS)
-- **GitHub CLI**: Deployment and authentication
+- **Go 1.21+**: Backend services and vulnerable demo application
+- **Node.js 18+**: Frontend development (when dashboard is implemented)
+- **Docker with Colima**: Container runtime without Docker Desktop dependency
+- **GitHub CLI**: Repository access and authentication
+- **Security Tools**: Trivy, Grype, Syft, and Cosign for vulnerability scanning and SBOM generation
 
 ### macOS Setup with Colima
 
+Colima provides Docker compatibility without Docker Desktop licensing requirements:
+
 ```bash
-# Install Colima for Docker runtime
-brew install colima
+# Install Colima and Docker CLI
+brew install colima docker
 
-# Start Colima
-colima start
+# Start Colima with specific configuration
+colima start --cpu 4 --memory 8 --disk 60
 
-# Verify Docker is working
+# Verify Docker connectivity
 docker --version
+docker ps
+
+# Test container functionality
+docker run hello-world
+```
+
+### Security Tools Installation
+
+Install required security scanning tools:
+
+```bash
+# Install Trivy vulnerability scanner
+brew install trivy
+
+# Install Grype vulnerability scanner
+brew install anchore/grype/grype
+
+# Install Syft SBOM generator
+brew install anchore/syft/syft
+
+# Install Cosign for cryptographic signing
+brew install cosign
+
+# Verify installations
+trivy --version
+grype version
+syft version
+cosign version
+```
+
+### GitHub CLI Setup
+
+Configure GitHub CLI for repository access:
+
+```bash
+# Install GitHub CLI
+brew install gh
+
+# Authenticate with GitHub
+gh auth login
+
+# Verify authentication
+gh auth status
+
+# Test repository access
+gh repo view salman-frs/keystone
 ```
 
 ### Verification Commands
 
 ```bash
-# Check Go version
+# Check Go version (required: 1.21+)
 go version
 
-# Check Node.js version  
-node --version
-
-# Check Docker connectivity
+# Check Docker connectivity via Colima
 docker ps
+docker system info
 
-# Check GitHub CLI
-gh --version
+# Check GitHub CLI authentication
+gh auth status
+
+# Verify security tools
+trivy --version
+grype version
+syft version
+cosign version
 ```
 
 ## Local Development Environment
@@ -54,135 +107,233 @@ ls -la
 
 ### 2. Environment Configuration
 
-```bash
-# Copy environment template
-cp .env.example .env.local
-
-# Edit configuration
-vim .env.local
-```
-
-### 3. Start Development Services
+Keystone uses environment variables for configuration:
 
 ```bash
-# Start all services
-docker-compose up -d
+# Create environment configuration (if .env.example exists)
+if [ -f .env.example ]; then
+    cp .env.example .env.local
+fi
 
-# Check service status
-docker-compose ps
+# Set GitHub token for API access
+export GITHUB_TOKEN="your-github-token"
 
-# View logs
-docker-compose logs -f
+# Verify environment
+echo $GITHUB_TOKEN | cut -c1-10
 ```
 
-### 4. Verify Installation
+### 3. Verify Project Structure
 
-- Dashboard: http://localhost:3000
-- API Health: http://localhost:8080/health
+```bash
+# Confirm directory structure matches expectations
+ls -la
+ls .github/workflows/
+ls examples/
+ls scripts/setup/
+```
+
+### 4. Test Security Workflow
+
+Run the implemented security scanning workflow:
+
+```bash
+# Test vulnerability scanners
+./scripts/setup/validate-scanners.sh
+
+# Test SBOM generation
+./scripts/setup/test-sbom-workflow.sh
+
+# Test vulnerable application
+./scripts/setup/test-vulnerable-app.sh
+
+# Run complete workflow test
+./scripts/setup/test-workflow.sh
+```
+
+### 5. Verify Installation Success
+
+Confirm all components are working:
+
+```bash
+# Check vulnerable app builds
+cd examples/vulnerable-app
+go build -o vulnerable-app .
+cd ../..
+
+# Verify scanner outputs exist
+ls -la scanner-test-output/
+ls -la sbom-test-output/
+
+# Test GitHub Actions workflow locally (if act is installed)
+# brew install act
+# act push
+```
 
 ## Development Workflow
 
-### Backend Development (Go)
+### Security Pipeline Development
 
 ```bash
-# Navigate to API directory
-cd apps/api
+# Modify security workflow
+vim .github/workflows/security-pipeline.yaml
 
-# Install dependencies
+# Test workflow changes locally
+cd examples/vulnerable-app
 go mod tidy
+go build .
+cd ../..
 
-# Run tests
-go test ./...
-
-# Build services
-go build ./cmd/...
+# Run security scans
+trivy fs examples/vulnerable-app/ --format json --output scanner-test-output/trivy-format-test.json
+grype examples/vulnerable-app/ -o json > scanner-test-output/grype-format-test.json
 ```
 
-### Frontend Development (React)
+### SBOM Generation Workflow
 
 ```bash
-# Navigate to dashboard directory  
+# Generate SBOM for vulnerable app
+syft examples/vulnerable-app/ -o spdx-json=sbom-test-output/sbom-spdx.json
+syft examples/vulnerable-app/ -o cyclonedx-json=sbom-test-output/sbom-cyclonedx.json
+
+# Validate SBOM content
+cat sbom-test-output/sbom-spdx.json | jq '.packages | length'
+cat sbom-test-output/sbom-cyclonedx.json | jq '.components | length'
+```
+
+### Future Development (Planned)
+
+```bash
+# Backend API development (when implemented)
+cd apps/api
+go mod tidy
+go test ./...
+go build ./cmd/...
+
+# Frontend dashboard development (when implemented)
 cd apps/dashboard
-
-# Install dependencies
 npm install
-
-# Start development server
 npm run dev
-
-# Run tests
 npm test
 ```
 
-## Database Setup
+## Data Storage
 
-SQLite database files are created automatically in the `data/` directory:
+Keystone stores scan results and SBOM data locally:
 
 ```bash
-# Database location
-./data/keystone.db
+# Scan output directory
+ls -la scanner-test-output/
 
-# View database schema (after first run)
-sqlite3 ./data/keystone.db ".schema"
+# SBOM output directory  
+ls -la sbom-test-output/
+
+# GitHub Actions artifacts (when workflows run)
+# Stored in GitHub Container Registry: ghcr.io/salman-frs/keystone
 ```
 
 ## Troubleshooting
 
-### Common Issues
+### Common macOS Setup Issues
 
-**Docker connection errors:**
+**Colima startup failures:**
 ```bash
-# Restart Colima
-colima restart
+# Reset Colima completely
+colima delete
+colima start --cpu 4 --memory 8 --disk 60
 
-# Check Docker daemon
-docker system info
+# Check Colima status
+colima status
+colima list
 ```
 
-**Port conflicts:**
+**Docker connectivity issues:**
 ```bash
-# Check port usage
-lsof -i :3000
-lsof -i :8080
+# Verify Docker socket
+docker context ls
+docker system info
 
-# Update docker-compose.yml ports if needed
+# Restart Colima if needed
+colima restart
+```
+
+**Security tool installation issues:**
+```bash
+# Update Homebrew and retry
+brew update
+brew upgrade
+
+# Verify tool installations
+which trivy grype syft cosign
+```
+
+**GitHub CLI authentication issues:**
+```bash
+# Re-authenticate with GitHub
+gh auth logout
+gh auth login
+
+# Test repository access
+gh repo view salman-frs/keystone
 ```
 
 **Permission issues:**
 ```bash
-# Fix directory permissions
-chmod -R 755 ./data ./logs
+# Fix script permissions
+chmod +x scripts/setup/*.sh
+
+# Fix output directory permissions
+mkdir -p scanner-test-output sbom-test-output
+chmod -R 755 scanner-test-output sbom-test-output
 ```
 
 ## Next Steps
 
 Once setup is complete:
 
-1. Read the [Getting Started Guide](getting-started.md)
-2. Explore the [API Documentation](api/)
-3. Review [Security Guidelines](security/)
+1. **Follow Getting Started**: Read [Getting Started Guide](getting-started.md)
+2. **Run Demo Workflow**: Execute [Demo Guide](demo.md) for vulnerability detection demonstration
+3. **Explore Architecture**: Review [Architecture Overview](architecture.md) with system diagrams
+4. **Test Integration**: Examine GitHub Actions workflow in `.github/workflows/security-pipeline.yaml`
+5. **Review Examples**: Study vulnerable application in `examples/vulnerable-app/`
 
 ## Development Tools
 
 ### Recommended VSCode Extensions
 
-- Go extension
-- TypeScript and JavaScript Language Features
-- Tailwind CSS IntelliSense
-- Docker extension
+- **Go extension**: Go language support
+- **YAML extension**: GitHub Actions workflow editing
+- **Docker extension**: Container management
+- **GitHub Actions extension**: Workflow syntax highlighting
+- **JSON extension**: SBOM and scan result viewing
 
-### Useful Commands
+### Useful Development Commands
 
 ```bash
 # Format Go code
-go fmt ./...
+go fmt ./examples/vulnerable-app/
 
-# Format TypeScript/React code
-npm run format
+# Validate GitHub Actions workflow
+gh workflow list
+gh workflow view security-pipeline
 
-# Run full test suite
-./scripts/test.sh
+# Manual security scanning
+./scripts/setup/validate-scanners.sh
 
-# Build for production
-./scripts/build.sh
+# SBOM validation
+./scripts/setup/test-sbom-workflow.sh
+
+# Complete integration test
+./scripts/setup/test-workflow.sh
+```
+
+### Performance Optimization
+
+```bash
+# Optimize Colima for security scanning
+colima stop
+colima start --cpu 6 --memory 12 --disk 100
+
+# Cache scanner databases for faster scans
+trivy image --download-db-only
+grype db update
 ```
