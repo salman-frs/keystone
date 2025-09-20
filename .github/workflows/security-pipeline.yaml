@@ -1,0 +1,189 @@
+name: Security Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  GO_VERSION: '1.25'
+  NODE_VERSION: '22'
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      go-version: ${{ steps.versions.outputs.go-version }}
+      node-version: ${{ steps.versions.outputs.node-version }}
+    steps:
+      - name: Set versions
+        id: versions
+        run: |
+          echo "go-version=${{ env.GO_VERSION }}" >> $GITHUB_OUTPUT
+          echo "node-version=${{ env.NODE_VERSION }}" >> $GITHUB_OUTPUT
+
+  backend-build:
+    runs-on: ubuntu-latest
+    needs: setup
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ needs.setup.outputs.go-version }}
+
+      - name: Cache Go modules
+        uses: actions/cache@v4
+        with:
+          path: ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+
+      - name: Build Go services
+        run: |
+          echo "Backend build step - Go services will be built here"
+          echo "Current directory structure created for future Go services"
+
+  frontend-build:
+    runs-on: ubuntu-latest
+    needs: setup
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ needs.setup.outputs.node-version }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: |
+          echo "Frontend build step - Node.js dependencies will be installed here"
+          echo "Dashboard application structure created for future React development"
+
+      - name: Build frontend
+        run: |
+          echo "Frontend React dashboard will be built here"
+
+  vulnerability-scanning:
+    runs-on: ubuntu-latest
+    needs: [backend-build, frontend-build]
+    permissions:
+      security-events: write
+      packages: read
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build vulnerable demo container
+        run: |
+          docker build -t vulnerable-demo:latest examples/vulnerable-app/
+          echo "Built vulnerable demo container for scanning"
+
+      - name: Run Trivy scanner
+        id: trivy-scan
+        run: |
+          echo "Running Trivy vulnerability scan..."
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "${{ github.workspace }}":/workspace \
+            aquasec/trivy:latest image \
+            --format json \
+            --output /workspace/trivy-results.json \
+            vulnerable-demo:latest
+          echo "Trivy scan completed"
+        continue-on-error: true
+
+      - name: Run Grype scanner
+        id: grype-scan
+        run: |
+          echo "Running Grype vulnerability scan..."
+          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
+          grype vulnerable-demo:latest \
+            -o json \
+            --file grype-results.json
+          echo "Grype scan completed"
+        continue-on-error: true
+
+      - name: Parse vulnerability counts
+        id: parse-results
+        run: |
+          echo "Parsing vulnerability results..."
+
+          # Parse Trivy results
+          if [[ -f trivy-results.json ]]; then
+            trivy_critical=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity == "CRITICAL")] | length' trivy-results.json 2>/dev/null || echo "0")
+            trivy_high=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity == "HIGH")] | length' trivy-results.json 2>/dev/null || echo "0")
+            trivy_medium=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity == "MEDIUM")] | length' trivy-results.json 2>/dev/null || echo "0")
+            trivy_low=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity == "LOW")] | length' trivy-results.json 2>/dev/null || echo "0")
+            trivy_total=$((trivy_critical + trivy_high + trivy_medium + trivy_low))
+          else
+            trivy_critical=0; trivy_high=0; trivy_medium=0; trivy_low=0; trivy_total=0
+          fi
+
+          # Parse Grype results
+          if [[ -f grype-results.json ]]; then
+            grype_critical=$(jq '[.matches[]? | select(.vulnerability.severity == "Critical")] | length' grype-results.json 2>/dev/null || echo "0")
+            grype_high=$(jq '[.matches[]? | select(.vulnerability.severity == "High")] | length' grype-results.json 2>/dev/null || echo "0")
+            grype_medium=$(jq '[.matches[]? | select(.vulnerability.severity == "Medium")] | length' grype-results.json 2>/dev/null || echo "0")
+            grype_low=$(jq '[.matches[]? | select(.vulnerability.severity == "Low")] | length' grype-results.json 2>/dev/null || echo "0")
+            grype_total=$((grype_critical + grype_high + grype_medium + grype_low))
+          else
+            grype_critical=0; grype_high=0; grype_medium=0; grype_low=0; grype_total=0
+          fi
+
+          # Output to GitHub Actions summary
+          {
+            echo "# Vulnerability Scan Results"
+            echo ""
+            echo "## Scanner Comparison"
+            echo "| Scanner | Critical | High | Medium | Low | Total |"
+            echo "|---------|----------|------|--------|-----|-------|"
+            echo "| **Trivy** | $trivy_critical | $trivy_high | $trivy_medium | $trivy_low | **$trivy_total** |"
+            echo "| **Grype** | $grype_critical | $grype_high | $grype_medium | $grype_low | **$grype_total** |"
+            echo ""
+            echo "## Scan Details"
+            echo "-  **Target**: vulnerable-demo:latest container"
+            echo "-  **OS Packages**: Scanned for known vulnerabilities"
+            echo "-  **Dependencies**: Go modules and application dependencies analyzed"
+            echo "-  **Base Image**: Container base image vulnerabilities detected"
+          } >> $GITHUB_STEP_SUMMARY
+
+          echo "Vulnerability count parsing completed"
+
+      - name: Upload Trivy results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: trivy-vulnerability-results
+          path: trivy-results.json
+          retention-days: 30
+
+      - name: Upload Grype results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: grype-vulnerability-results
+          path: grype-results.json
+          retention-days: 30
+
+      - name: Check scanner failures
+        run: |
+          trivy_exit=${{ steps.trivy-scan.outcome }}
+          grype_exit=${{ steps.grype-scan.outcome }}
+
+          if [[ "$trivy_exit" != "success" && "$grype_exit" != "success" ]]; then
+            echo "Both scanners failed - workflow will fail"
+            exit 1
+          elif [[ "$trivy_exit" != "success" ]]; then
+            echo " Trivy scanner failed, but Grype succeeded"
+          elif [[ "$grype_exit" != "success" ]]; then
+            echo " Grype scanner failed, but Trivy succeeded"
+          else
+            echo " Both scanners completed successfully"
+          fi

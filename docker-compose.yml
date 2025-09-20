@@ -1,0 +1,67 @@
+version: '3.8'
+
+services:
+  # Backend API Services
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    ports:
+      - "8080:8080"
+    environment:
+      - ENV=development
+      - LOG_LEVEL=debug
+      - DATABASE_PATH=/app/data/keystone.db
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./infrastructure/policies:/app/policies
+    networks:
+      - keystone-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # Frontend Dashboard (Development)
+  dashboard:
+    image: node:22-alpine
+    working_dir: /app
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=development
+      - VITE_API_URL=http://api:8080
+    volumes:
+      - ./apps/dashboard:/app
+      - ./packages:/packages
+      - /app/node_modules
+    command: sh -c "echo 'Dashboard dev server will run here' && sleep infinity"
+    networks:
+      - keystone-network
+    depends_on:
+      - api
+
+  # SQLite Database (File-based, no separate container needed)
+  # Database files will be mounted via volumes to ./data directory
+
+  # Development Tools
+  tools:
+    image: alpine:3.19
+    volumes:
+      - .:/workspace
+    working_dir: /workspace
+    command: sh -c "echo 'Development tools container ready' && sleep infinity"
+    networks:
+      - keystone-network
+
+networks:
+  keystone-network:
+    driver: bridge
+
+volumes:
+  node_modules:
+    driver: local
