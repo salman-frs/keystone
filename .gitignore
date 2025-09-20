@@ -286,3 +286,12 @@ temp/
 .bmad-core/
 .claude/
 /docs/
+
+# === Test Output Directories ===
+sbom-test-output/
+scanner-test-output/
+
+# === Additional Generated SBOM Files ===
+bom.json
+*-sbom.json
+sbom-*.json

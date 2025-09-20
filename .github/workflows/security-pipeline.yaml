@@ -75,7 +75,7 @@ jobs:
     needs: [backend-build, frontend-build]
     permissions:
       security-events: write
-      packages: read
+      packages: write
       contents: read
     steps:
       - name: Checkout code
@@ -139,19 +139,54 @@ jobs:
 
           # Output to GitHub Actions summary
           {
-            echo "# Vulnerability Scan Results"
+            echo "# Security Pipeline Results"
             echo ""
-            echo "## Scanner Comparison"
+            echo "## Vulnerability Scan Results"
             echo "| Scanner | Critical | High | Medium | Low | Total |"
             echo "|---------|----------|------|--------|-----|-------|"
             echo "| **Trivy** | $trivy_critical | $trivy_high | $trivy_medium | $trivy_low | **$trivy_total** |"
             echo "| **Grype** | $grype_critical | $grype_high | $grype_medium | $grype_low | **$grype_total** |"
             echo ""
+            echo "## SBOM Generation Results"
+            echo "| Format | Components/Packages | Validation | Status |"
+            echo "|---------|----------|------|-------|"
+            cyclonedx_validation=$([ "${{ steps.validate-sbom.outputs.validation_errors }}" = "0" ] && echo "PASS" || echo "FAIL")
+            spdx_validation=$([ "${{ steps.validate-sbom.outputs.validation_errors }}" = "0" ] && echo "PASS" || echo "FAIL")
+            cyclonedx_status=$([ "${{ steps.sbom-cyclonedx.outcome }}" = "success" ] && echo "Generated" || echo "Failed")
+            spdx_status=$([ "${{ steps.sbom-spdx.outcome }}" = "success" ] && echo "Generated" || echo "Failed")
+            echo "| **CycloneDX** | ${{ steps.parse-sbom.outputs.cyclonedx_components }} components | $cyclonedx_validation | $cyclonedx_status |"
+            echo "| **SPDX** | ${{ steps.parse-sbom.outputs.spdx_packages }} packages | $spdx_validation | $spdx_status |"
+            echo ""
+            echo "## SBOM Metadata"
+            echo "- **Target**: vulnerable-demo:latest container"
+            echo "- **Scope**: All container layers included"
+            echo "- **CycloneDX Component**: ${{ steps.parse-sbom.outputs.cyclonedx_metadata }}"
+            echo "- **SPDX Document**: ${{ steps.parse-sbom.outputs.spdx_name }}"
+            echo "- **Unique Licenses**: ${{ steps.parse-sbom.outputs.cyclonedx_licenses }}"
+            echo "- **SPDX Relationships**: ${{ steps.parse-sbom.outputs.spdx_relationships }}"
+            echo ""
+            echo "## SBOM Container Registry References"
+            if [[ "${{ steps.upload-cyclonedx.outcome }}" == "success" ]]; then
+              echo "- **CycloneDX SBOM**: \`${{ steps.upload-cyclonedx.outputs.cyclonedx_registry_ref }}\`"
+            else
+              echo "- **CycloneDX SBOM**: Upload failed"
+            fi
+            if [[ "${{ steps.upload-spdx.outcome }}" == "success" ]]; then
+              echo "- **SPDX SBOM**: \`${{ steps.upload-spdx.outputs.spdx_registry_ref }}\`"
+            else
+              echo "- **SPDX SBOM**: Upload failed"
+            fi
+            echo ""
+            echo "## Artifact Downloads"
+            echo "- [CycloneDX SBOM](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) (sbom-cyclonedx artifact)"
+            echo "- [SPDX SBOM](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) (sbom-spdx artifact)"
+            echo "- [Trivy Results](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) (trivy-vulnerability-results artifact)"
+            echo "- [Grype Results](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) (grype-vulnerability-results artifact)"
+            echo ""
             echo "## Scan Details"
-            echo "-  **Target**: vulnerable-demo:latest container"
-            echo "-  **OS Packages**: Scanned for known vulnerabilities"
-            echo "-  **Dependencies**: Go modules and application dependencies analyzed"
-            echo "-  **Base Image**: Container base image vulnerabilities detected"
+            echo "- **OS Packages**: Scanned for known vulnerabilities"
+            echo "- **Dependencies**: Go modules and application dependencies analyzed"
+            echo "- **Base Image**: Container base image vulnerabilities detected"
           } >> $GITHUB_STEP_SUMMARY
 
           echo "Vulnerability count parsing completed"
@@ -171,6 +206,232 @@ jobs:
           name: grype-vulnerability-results
           path: grype-results.json
           retention-days: 30
+
+      - name: Install Syft SBOM generator
+        run: |
+          echo "Installing Syft for SBOM generation..."
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
+          syft version
+          echo "Syft installation completed"
+
+      - name: Generate SBOM in CycloneDX format
+        id: sbom-cyclonedx
+        run: |
+          echo "Generating CycloneDX SBOM for vulnerable-demo:latest..."
+          syft vulnerable-demo:latest \
+            --scope all-layers \
+            -o cyclonedx-json=sbom-cyclonedx.json \
+            -v
+          echo "CycloneDX SBOM generation completed"
+        continue-on-error: true
+
+      - name: Generate SBOM in SPDX format
+        id: sbom-spdx
+        run: |
+          echo "Generating SPDX SBOM for vulnerable-demo:latest..."
+          syft vulnerable-demo:latest \
+            --scope all-layers \
+            -o spdx-json=sbom-spdx.json \
+            -v
+          echo "SPDX SBOM generation completed"
+        continue-on-error: true
+
+      - name: Install SBOM validation tools
+        run: |
+          echo "Installing SBOM validation tools..."
+          # Install CycloneDX CLI for validation
+          npm install -g @cyclonedx/cyclonedx-cli
+          # Install SPDX tools for validation
+          pip install spdx-tools
+          echo "SBOM validation tools installed"
+
+      - name: Validate SBOM formats
+        id: validate-sbom
+        run: |
+          echo "Validating SBOM format compliance..."
+          validation_errors=0
+          
+          # Validate CycloneDX SBOM
+          if [[ -f sbom-cyclonedx.json ]]; then
+            echo "Validating CycloneDX SBOM format..."
+            if cyclonedx-cli validate --input-file sbom-cyclonedx.json; then
+              echo "PASS: CycloneDX SBOM validation passed"
+            else
+              echo "FAIL: CycloneDX SBOM validation failed"
+              validation_errors=$((validation_errors + 1))
+            fi
+          else
+            echo "FAIL: CycloneDX SBOM file not found"
+            validation_errors=$((validation_errors + 1))
+          fi
+          
+          # Validate SPDX SBOM
+          if [[ -f sbom-spdx.json ]]; then
+            echo "Validating SPDX SBOM format..."
+            if spdx-tools-convert sbom-spdx.json; then
+              echo "PASS: SPDX SBOM validation passed"
+            else
+              echo "FAIL: SPDX SBOM validation failed"
+              validation_errors=$((validation_errors + 1))
+            fi
+          else
+            echo "FAIL: SPDX SBOM file not found"
+            validation_errors=$((validation_errors + 1))
+          fi
+          
+          echo "validation_errors=$validation_errors" >> $GITHUB_OUTPUT
+          
+          if [[ $validation_errors -eq 0 ]]; then
+            echo "PASS: All SBOM validations passed"
+          else
+            echo "FAIL: $validation_errors SBOM validation(s) failed"
+          fi
+        continue-on-error: true
+
+      - name: Parse SBOM metadata
+        id: parse-sbom
+        run: |
+          echo "Parsing SBOM metadata for summary..."
+          
+          # Parse CycloneDX SBOM
+          if [[ -f sbom-cyclonedx.json ]]; then
+            cyclonedx_components=$(jq '.components | length' sbom-cyclonedx.json 2>/dev/null || echo "0")
+            cyclonedx_metadata=$(jq -r '.metadata.component.name // "N/A"' sbom-cyclonedx.json 2>/dev/null || echo "N/A")
+            cyclonedx_licenses=$(jq '[.components[].licenses[]?.license.name // empty] | unique | length' sbom-cyclonedx.json 2>/dev/null || echo "0")
+          else
+            cyclonedx_components=0; cyclonedx_metadata="N/A"; cyclonedx_licenses=0
+          fi
+          
+          # Parse SPDX SBOM
+          if [[ -f sbom-spdx.json ]]; then
+            spdx_packages=$(jq '.packages | length' sbom-spdx.json 2>/dev/null || echo "0")
+            spdx_name=$(jq -r '.name // "N/A"' sbom-spdx.json 2>/dev/null || echo "N/A")
+            spdx_relationships=$(jq '.relationships | length' sbom-spdx.json 2>/dev/null || echo "0")
+          else
+            spdx_packages=0; spdx_name="N/A"; spdx_relationships=0
+          fi
+          
+          echo "cyclonedx_components=$cyclonedx_components" >> $GITHUB_OUTPUT
+          echo "cyclonedx_metadata=$cyclonedx_metadata" >> $GITHUB_OUTPUT
+          echo "cyclonedx_licenses=$cyclonedx_licenses" >> $GITHUB_OUTPUT
+          echo "spdx_packages=$spdx_packages" >> $GITHUB_OUTPUT
+          echo "spdx_name=$spdx_name" >> $GITHUB_OUTPUT
+          echo "spdx_relationships=$spdx_relationships" >> $GITHUB_OUTPUT
+
+      - name: Upload CycloneDX SBOM
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sbom-cyclonedx
+          path: sbom-cyclonedx.json
+          retention-days: 30
+
+      - name: Upload SPDX SBOM
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sbom-spdx
+          path: sbom-spdx.json
+          retention-days: 30
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install ORAS for OCI artifact uploads
+        run: |
+          echo "Installing ORAS for OCI artifact management..."
+          curl -LO https://github.com/oras-project/oras/releases/latest/download/oras_linux_amd64.tar.gz
+          mkdir -p oras-install/
+          tar -zxf oras_linux_amd64.tar.gz -C oras-install/
+          sudo mv oras-install/oras /usr/local/bin/
+          rm -rf oras-install oras_linux_amd64.tar.gz
+          oras version
+          echo "ORAS installation completed"
+
+      - name: Upload CycloneDX SBOM to Container Registry
+        id: upload-cyclonedx
+        run: |
+          echo "Uploading CycloneDX SBOM to GitHub Container Registry..."
+          IMAGE_REF="ghcr.io/${{ github.repository_owner }}/$(echo '${{ github.repository }}' | cut -d'/' -f2)"
+          SBOM_REF="${IMAGE_REF}/sbom:cyclonedx-${{ github.sha }}"
+          
+          if [[ -f sbom-cyclonedx.json ]]; then
+            oras push "$SBOM_REF" \
+              --annotation "org.opencontainers.image.title=CycloneDX SBOM" \
+              --annotation "org.opencontainers.image.description=Software Bill of Materials in CycloneDX format" \
+              --annotation "org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}" \
+              --annotation "org.opencontainers.image.revision=${{ github.sha }}" \
+              --annotation "org.opencontainers.image.created=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+              --annotation "sbom.format=cyclonedx" \
+              --annotation "sbom.version=1.6" \
+              --annotation "target.image=vulnerable-demo:latest" \
+              sbom-cyclonedx.json:application/vnd.cyclonedx+json
+            echo "cyclonedx_registry_ref=$SBOM_REF" >> $GITHUB_OUTPUT
+            echo "CycloneDX SBOM uploaded successfully to $SBOM_REF"
+          else
+            echo "FAIL: CycloneDX SBOM file not found for upload"
+            exit 1
+          fi
+        continue-on-error: true
+
+      - name: Upload SPDX SBOM to Container Registry
+        id: upload-spdx
+        run: |
+          echo "Uploading SPDX SBOM to GitHub Container Registry..."
+          IMAGE_REF="ghcr.io/${{ github.repository_owner }}/$(echo '${{ github.repository }}' | cut -d'/' -f2)"
+          SBOM_REF="${IMAGE_REF}/sbom:spdx-${{ github.sha }}"
+          
+          if [[ -f sbom-spdx.json ]]; then
+            oras push "$SBOM_REF" \
+              --annotation "org.opencontainers.image.title=SPDX SBOM" \
+              --annotation "org.opencontainers.image.description=Software Bill of Materials in SPDX format" \
+              --annotation "org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}" \
+              --annotation "org.opencontainers.image.revision=${{ github.sha }}" \
+              --annotation "org.opencontainers.image.created=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+              --annotation "sbom.format=spdx" \
+              --annotation "sbom.version=2.3" \
+              --annotation "target.image=vulnerable-demo:latest" \
+              spdx-sbom.json:application/spdx+json
+            echo "spdx_registry_ref=$SBOM_REF" >> $GITHUB_OUTPUT
+            echo "SPDX SBOM uploaded successfully to $SBOM_REF"
+          else
+            echo "FAIL: SPDX SBOM file not found for upload"
+            exit 1
+          fi
+        continue-on-error: true
+
+      - name: Verify SBOM uploads
+        run: |
+          echo "Verifying SBOM uploads to Container Registry..."
+          upload_errors=0
+          
+          # Check CycloneDX upload
+          if [[ "${{ steps.upload-cyclonedx.outcome }}" == "success" ]]; then
+            echo "PASS: CycloneDX SBOM uploaded to registry"
+            echo "Registry reference: ${{ steps.upload-cyclonedx.outputs.cyclonedx_registry_ref }}"
+          else
+            echo "FAIL: CycloneDX SBOM upload failed"
+            upload_errors=$((upload_errors + 1))
+          fi
+          
+          # Check SPDX upload
+          if [[ "${{ steps.upload-spdx.outcome }}" == "success" ]]; then
+            echo "PASS: SPDX SBOM uploaded to registry"
+            echo "Registry reference: ${{ steps.upload-spdx.outputs.spdx_registry_ref }}"
+          else
+            echo "FAIL: SPDX SBOM upload failed"
+            upload_errors=$((upload_errors + 1))
+          fi
+          
+          if [[ $upload_errors -eq 0 ]]; then
+            echo "PASS: All SBOM uploads completed successfully"
+          else
+            echo "FAIL: $upload_errors SBOM upload(s) failed"
+          fi
 
       - name: Check scanner failures
         run: |
