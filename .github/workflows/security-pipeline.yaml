@@ -448,3 +448,671 @@ jobs:
           else
             echo " Both scanners completed successfully"
           fi
+
+  keyless-signing:
+    runs-on: ubuntu-latest
+    needs: [vulnerability-scanning]
+    permissions:
+      id-token: write
+      contents: read
+      packages: write
+    env:
+      COSIGN_EXPERIMENTAL: 1
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Cosign CLI
+        id: install-cosign
+        run: |
+          echo "Installing Cosign CLI v2.2.3..."
+          COSIGN_VERSION="v2.2.3"
+          COSIGN_BINARY="cosign-linux-amd64"
+          COSIGN_URL="https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/${COSIGN_BINARY}"
+          COSIGN_CHECKSUM_URL="https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign_checksums.txt"
+
+          # Download Cosign binary and checksums
+          curl -sSL "$COSIGN_URL" -o cosign
+          curl -sSL "$COSIGN_CHECKSUM_URL" -o cosign_checksums.txt
+
+          # Verify checksum for security
+          EXPECTED_CHECKSUM=$(grep "$COSIGN_BINARY" cosign_checksums.txt | cut -d' ' -f1)
+          ACTUAL_CHECKSUM=$(sha256sum cosign | cut -d' ' -f1)
+
+          if [[ "$EXPECTED_CHECKSUM" != "$ACTUAL_CHECKSUM" ]]; then
+            echo "SIGN_011: Cosign checksum verification failed"
+            echo "Expected: $EXPECTED_CHECKSUM"
+            echo "Actual: $ACTUAL_CHECKSUM"
+            exit 1
+          fi
+
+          # Install Cosign
+          chmod +x cosign
+          sudo mv cosign /usr/local/bin/cosign
+
+          # Verify installation
+          cosign version
+          echo "Cosign CLI v2.2.3 installed successfully with checksum verification"
+
+      - name: Configure and test GitHub OIDC token
+        id: test-oidc
+        run: |
+          echo "Configuring and testing GitHub OIDC token for Sigstore..."
+
+          # Test OIDC token environment variables
+          echo "Testing GitHub OIDC token environment..."
+          if [[ -z "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" ]]; then
+            echo "SIGN_001: OIDC token request token not available"
+            exit 1
+          fi
+
+          if [[ -z "$ACTIONS_ID_TOKEN_REQUEST_URL" ]]; then
+            echo "SIGN_002: OIDC token request URL not available"
+            exit 1
+          fi
+
+          # Configure OIDC claims for Sigstore
+          echo "Configuring OIDC claims for identity verification..."
+
+          # Set issuer and audience for Sigstore
+          OIDC_ISSUER="https://token.actions.githubusercontent.com"
+          OIDC_AUDIENCE="sigstore"
+
+          # Test OIDC token acquisition
+          echo "Testing OIDC token acquisition..."
+          OIDC_TOKEN=$(curl -sH "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+                           "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$OIDC_AUDIENCE" | \
+                           jq -r '.value' 2>/dev/null)
+
+          if [[ -z "$OIDC_TOKEN" || "$OIDC_TOKEN" == "null" ]]; then
+            echo "SIGN_003: OIDC token acquisition failed"
+            exit 1
+          fi
+
+          # Validate token claims
+          echo "Validating OIDC token claims..."
+          TOKEN_HEADER=$(echo "$OIDC_TOKEN" | cut -d'.' -f1)
+          TOKEN_PAYLOAD=$(echo "$OIDC_TOKEN" | cut -d'.' -f2)
+
+          # Decode and validate payload (add padding if needed)
+          PADDED_PAYLOAD=$(echo "$TOKEN_PAYLOAD" | sed 's/$/===/' | fold -w 4 | head -1)
+          TOKEN_CLAIMS=$(echo "$PADDED_PAYLOAD" | base64 -d 2>/dev/null | jq . 2>/dev/null || echo "{}")
+
+          # Extract and validate key claims
+          ISS=$(echo "$TOKEN_CLAIMS" | jq -r '.iss // empty')
+          AUD=$(echo "$TOKEN_CLAIMS" | jq -r '.aud // empty')
+          SUB=$(echo "$TOKEN_CLAIMS" | jq -r '.sub // empty')
+          ACTOR=$(echo "$TOKEN_CLAIMS" | jq -r '.actor // empty')
+          REPOSITORY=$(echo "$TOKEN_CLAIMS" | jq -r '.repository // empty')
+
+          echo "OIDC Token Claims:"
+          echo "  Issuer (iss): $ISS"
+          echo "  Audience (aud): $AUD"
+          echo "  Subject (sub): $SUB"
+          echo "  Actor: $ACTOR"
+          echo "  Repository: $REPOSITORY"
+
+          # Validate required claims
+          if [[ "$ISS" != "$OIDC_ISSUER" ]]; then
+            echo "SIGN_004: Invalid OIDC issuer claim"
+            exit 1
+          fi
+
+          if [[ "$AUD" != "$OIDC_AUDIENCE" ]]; then
+            echo "SIGN_005: Invalid OIDC audience claim"
+            exit 1
+          fi
+
+          if [[ -z "$SUB" ]]; then
+            echo "SIGN_006: Missing OIDC subject claim"
+            exit 1
+          fi
+
+          # Set environment variables for downstream steps
+          echo "OIDC_TOKEN_VERIFIED=true" >> $GITHUB_ENV
+          echo "OIDC_ISSUER=$OIDC_ISSUER" >> $GITHUB_ENV
+          echo "OIDC_AUDIENCE=$OIDC_AUDIENCE" >> $GITHUB_ENV
+          echo "OIDC_SUBJECT=$SUB" >> $GITHUB_ENV
+
+          echo "PASS: OIDC token configuration and validation completed"
+          echo "Identity verified: $SUB"
+
+      - name: Test Cosign with OIDC integration
+        id: test-cosign
+        run: |
+          echo "Testing Cosign CLI with OIDC integration..."
+
+          # Test Cosign version and help
+          echo "Testing Cosign CLI functionality..."
+          cosign version
+
+          # Test OIDC integration
+          echo "Testing Cosign OIDC integration..."
+          echo "COSIGN_EXPERIMENTAL: $COSIGN_EXPERIMENTAL"
+          echo "OIDC verified: $OIDC_TOKEN_VERIFIED"
+          echo "OIDC issuer: $OIDC_ISSUER"
+          echo "OIDC audience: $OIDC_AUDIENCE"
+          echo "OIDC subject: $OIDC_SUBJECT"
+
+          # Verify Cosign can access OIDC token
+          if [[ "$OIDC_TOKEN_VERIFIED" != "true" ]]; then
+            echo "SIGN_007: OIDC token not verified for Cosign"
+            exit 1
+          fi
+
+          echo "PASS: Cosign CLI ready for keyless signing with OIDC identity"
+          echo "Signing identity: $OIDC_SUBJECT"
+
+      - name: Prepare demo container for signing
+        id: prepare-container
+        run: |
+          echo "Preparing vulnerable demo container for signing tests..."
+
+          # Build the demo container for signing
+          docker build -t vulnerable-demo:signing-test examples/vulnerable-app/
+
+          # Get container digest for signing
+          CONTAINER_DIGEST=$(docker inspect vulnerable-demo:signing-test --format='{{index .RepoDigests 0}}' 2>/dev/null || echo "")
+
+          if [[ -z "$CONTAINER_DIGEST" ]]; then
+            # For local images without repo digests, use image ID
+            CONTAINER_ID=$(docker inspect vulnerable-demo:signing-test --format='{{.Id}}')
+            echo "container_target=vulnerable-demo:signing-test@$CONTAINER_ID" >> $GITHUB_OUTPUT
+            echo "Container prepared for signing: vulnerable-demo:signing-test@$CONTAINER_ID"
+          else
+            echo "container_target=$CONTAINER_DIGEST" >> $GITHUB_OUTPUT
+            echo "Container prepared for signing: $CONTAINER_DIGEST"
+          fi
+
+      - name: Implement keyless signing for container images
+        id: keyless-signing
+        run: |
+          echo "Implementing keyless signing for container images..."
+
+          # Get container target from previous step
+          CONTAINER_TARGET="${{ steps.prepare-container.outputs.container_target }}"
+
+          if [[ -z "$CONTAINER_TARGET" ]]; then
+            echo "SIGN_021: Container target not resolved"
+            exit 1
+          fi
+
+          echo "Signing target: $CONTAINER_TARGET"
+          echo "Signing identity: $OIDC_SUBJECT"
+
+          # Configure signing metadata and annotations
+          echo "Configuring signing metadata and annotations..."
+
+          SIGNING_TIME=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+          WORKFLOW_REF="${{ github.workflow }}@${{ github.ref }}"
+          COMMIT_SHA="${{ github.sha }}"
+
+          # Create signing annotations
+          ANNOTATIONS=(
+            "--annotation=org.opencontainers.image.title=Vulnerable Demo Container"
+            "--annotation=org.opencontainers.image.description=Demo container for security scanning"
+            "--annotation=org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}"
+            "--annotation=org.opencontainers.image.revision=$COMMIT_SHA"
+            "--annotation=org.opencontainers.image.created=$SIGNING_TIME"
+            "--annotation=keystone.signature.workflow=$WORKFLOW_REF"
+            "--annotation=keystone.signature.actor=${{ github.actor }}"
+            "--annotation=keystone.signature.repository=${{ github.repository }}"
+            "--annotation=keystone.signature.type=keyless"
+          )
+
+          # Perform keyless signing using GitHub OIDC identity
+          echo "Performing keyless signing with Cosign..."
+
+          if cosign sign --yes "${ANNOTATIONS[@]}" "$CONTAINER_TARGET"; then
+            echo "PASS: Container image signed successfully"
+            echo "Signature created with OIDC identity: $OIDC_SUBJECT"
+            echo "Signed at: $SIGNING_TIME"
+            echo "Container: $CONTAINER_TARGET"
+
+            # Store signing results
+            echo "container_signed=true" >> $GITHUB_OUTPUT
+            echo "signing_time=$SIGNING_TIME" >> $GITHUB_OUTPUT
+            echo "signed_identity=$OIDC_SUBJECT" >> $GITHUB_OUTPUT
+          else
+            echo "SIGN_031: Keyless signing process failed"
+            exit 1
+          fi
+
+      - name: Verify container signature
+        id: verify-signature
+        run: |
+          echo "Verifying container signature immediately after signing..."
+
+          CONTAINER_TARGET="${{ steps.prepare-container.outputs.container_target }}"
+
+          # Verify signature with identity verification
+          echo "Verifying signature with identity: $OIDC_SUBJECT"
+
+          if cosign verify \
+              --certificate-identity="$OIDC_SUBJECT" \
+              --certificate-oidc-issuer="$OIDC_ISSUER" \
+              "$CONTAINER_TARGET"; then
+            echo "PASS: Container signature verified successfully"
+            echo "Signature verified for identity: $OIDC_SUBJECT"
+            echo "signature_verified=true" >> $GITHUB_OUTPUT
+          else
+            echo "SIGN_051: Signature verification failed"
+            exit 1
+          fi
+
+      - name: Configure Rekor transparency log integration
+        id: rekor-integration
+        run: |
+          echo "Configuring Rekor transparency log integration..."
+
+          # Configure Rekor transparency log endpoint
+          REKOR_URL="https://rekor.sigstore.dev"
+          echo "Rekor transparency log endpoint: $REKOR_URL"
+
+          # Install Rekor CLI for log operations
+          echo "Installing Rekor CLI for log entry operations..."
+          REKOR_VERSION="v1.3.6"
+          REKOR_BINARY="rekor-cli-linux-amd64"
+          REKOR_CLI_URL="https://github.com/sigstore/rekor/releases/download/${REKOR_VERSION}/${REKOR_BINARY}"
+
+          curl -sSL "$REKOR_CLI_URL" -o rekor-cli
+          chmod +x rekor-cli
+          sudo mv rekor-cli /usr/local/bin/rekor-cli
+
+          # Test Rekor CLI installation
+          rekor-cli version
+          echo "Rekor CLI installed successfully"
+
+          # Configure Rekor connection settings
+          echo "REKOR_URL=$REKOR_URL" >> $GITHUB_ENV
+          echo "rekor_endpoint_configured=true" >> $GITHUB_OUTPUT
+
+      - name: Capture and verify Rekor log entries
+        id: rekor-verification
+        run: |
+          echo "Capturing and verifying Rekor transparency log entries..."
+
+          CONTAINER_TARGET="${{ steps.prepare-container.outputs.container_target }}"
+
+          # Search for log entries related to our signature
+          echo "Searching for transparency log entries..."
+
+          # Get the public key used for verification
+          PUBLIC_KEY_PEM=$(cosign verify \
+              --certificate-identity="$OIDC_SUBJECT" \
+              --certificate-oidc-issuer="$OIDC_ISSUER" \
+              "$CONTAINER_TARGET" 2>/dev/null | \
+              jq -r '.[0].optional.Bundle.Payload.body' | \
+              base64 -d | jq -r '.spec.signature.publicKey.content' || echo "")
+
+          if [[ -z "$PUBLIC_KEY_PEM" ]]; then
+            echo "SIGN_041: Could not extract public key from signature"
+            exit 1
+          fi
+
+          # Search Rekor for entries by public key
+          echo "Searching Rekor for log entries..."
+
+          # Create temporary file for public key
+          echo "$PUBLIC_KEY_PEM" > /tmp/pub_key.pem
+
+          # Search for log entries
+          LOG_ENTRIES=$(rekor-cli search --public-key /tmp/pub_key.pem --format json 2>/dev/null || echo "[]")
+
+          if [[ "$LOG_ENTRIES" == "[]" || -z "$LOG_ENTRIES" ]]; then
+            echo "SIGN_042: No transparency log entries found for signature"
+            exit 1
+          fi
+
+          # Extract log entry UUIDs
+          LOG_UUIDS=$(echo "$LOG_ENTRIES" | jq -r '.[]' 2>/dev/null || echo "")
+
+          if [[ -z "$LOG_UUIDS" ]]; then
+            echo "SIGN_043: Could not extract log entry UUIDs"
+            exit 1
+          fi
+
+          echo "Found transparency log entries:"
+          echo "$LOG_UUIDS"
+
+          # Get detailed information for the first log entry
+          FIRST_UUID=$(echo "$LOG_UUIDS" | head -1)
+          echo "Retrieving details for log entry: $FIRST_UUID"
+
+          LOG_ENTRY_DETAILS=$(rekor-cli get --uuid "$FIRST_UUID" --format json 2>/dev/null || echo "{}")
+
+          if [[ "$LOG_ENTRY_DETAILS" == "{}" ]]; then
+            echo "SIGN_044: Could not retrieve log entry details"
+            exit 1
+          fi
+
+          # Extract log entry metadata
+          LOG_INDEX=$(echo "$LOG_ENTRY_DETAILS" | jq -r '.LogIndex // empty')
+          LOG_ID=$(echo "$LOG_ENTRY_DETAILS" | jq -r '.LogID // empty')
+          INTEGRATED_TIME=$(echo "$LOG_ENTRY_DETAILS" | jq -r '.IntegratedTime // empty')
+
+          echo "Transparency log entry verified:"
+          echo "  UUID: $FIRST_UUID"
+          echo "  Log Index: $LOG_INDEX"
+          echo "  Log ID: $LOG_ID"
+          echo "  Integrated Time: $INTEGRATED_TIME"
+
+          # Store log entry information
+          echo "log_entry_uuid=$FIRST_UUID" >> $GITHUB_OUTPUT
+          echo "log_index=$LOG_INDEX" >> $GITHUB_OUTPUT
+          echo "integrated_time=$INTEGRATED_TIME" >> $GITHUB_OUTPUT
+          echo "rekor_verified=true" >> $GITHUB_OUTPUT
+
+          echo "PASS: Rekor transparency log integration verified"
+
+          # Clean up temporary files
+          rm -f /tmp/pub_key.pem
+
+      - name: Sign SBOM artifacts with keyless signing
+        id: sbom-signing
+        run: |
+          echo "Extending keyless signing to cover SBOM artifacts..."
+
+          # Check if SBOM files exist from vulnerability scanning job
+          CYCLONEDX_SBOM="sbom-cyclonedx.json"
+          SPDX_SBOM="sbom-spdx.json"
+
+          # Download SBOM artifacts from previous job
+          echo "Downloading SBOM artifacts for signing..."
+
+          # Since we're in the same workflow, artifacts from previous jobs need to be shared
+          # For now, we'll generate fresh SBOMs for signing demonstration
+          CONTAINER_TARGET="${{ steps.prepare-container.outputs.container_target }}"
+
+          # Install Syft for SBOM generation if not available
+          if ! command -v syft &> /dev/null; then
+            echo "Installing Syft for SBOM generation..."
+            curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
+          fi
+
+          # Generate SBOMs for signing
+          echo "Generating SBOMs for signing..."
+          syft "$CONTAINER_TARGET" --scope all-layers -o cyclonedx-json="$CYCLONEDX_SBOM"
+          syft "$CONTAINER_TARGET" --scope all-layers -o spdx-json="$SPDX_SBOM"
+
+          # Configure SBOM signing metadata
+          SIGNING_TIME=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+          WORKFLOW_REF="${{ github.workflow }}@${{ github.ref }}"
+          COMMIT_SHA="${{ github.sha }}"
+
+          # Sign CycloneDX SBOM
+          echo "Signing CycloneDX SBOM..."
+          CYCLONEDX_ANNOTATIONS=(
+            "--annotation=org.opencontainers.image.title=CycloneDX SBOM"
+            "--annotation=org.opencontainers.image.description=Software Bill of Materials in CycloneDX format"
+            "--annotation=org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}"
+            "--annotation=org.opencontainers.image.revision=$COMMIT_SHA"
+            "--annotation=org.opencontainers.image.created=$SIGNING_TIME"
+            "--annotation=keystone.sbom.format=cyclonedx"
+            "--annotation=keystone.sbom.version=1.6"
+            "--annotation=keystone.sbom.target=$CONTAINER_TARGET"
+            "--annotation=keystone.signature.workflow=$WORKFLOW_REF"
+            "--annotation=keystone.signature.type=keyless"
+          )
+
+          if cosign sign-blob --yes "${CYCLONEDX_ANNOTATIONS[@]}" --bundle="$CYCLONEDX_SBOM.bundle" "$CYCLONEDX_SBOM"; then
+            echo "PASS: CycloneDX SBOM signed successfully"
+            echo "cyclonedx_signed=true" >> $GITHUB_OUTPUT
+          else
+            echo "SIGN_061: CycloneDX SBOM signing failed"
+            exit 1
+          fi
+
+          # Sign SPDX SBOM
+          echo "Signing SPDX SBOM..."
+          SPDX_ANNOTATIONS=(
+            "--annotation=org.opencontainers.image.title=SPDX SBOM"
+            "--annotation=org.opencontainers.image.description=Software Bill of Materials in SPDX format"
+            "--annotation=org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}"
+            "--annotation=org.opencontainers.image.revision=$COMMIT_SHA"
+            "--annotation=org.opencontainers.image.created=$SIGNING_TIME"
+            "--annotation=keystone.sbom.format=spdx"
+            "--annotation=keystone.sbom.version=2.3"
+            "--annotation=keystone.sbom.target=$CONTAINER_TARGET"
+            "--annotation=keystone.signature.workflow=$WORKFLOW_REF"
+            "--annotation=keystone.signature.type=keyless"
+          )
+
+          if cosign sign-blob --yes "${SPDX_ANNOTATIONS[@]}" --bundle="$SPDX_SBOM.bundle" "$SPDX_SBOM"; then
+            echo "PASS: SPDX SBOM signed successfully"
+            echo "spdx_signed=true" >> $GITHUB_OUTPUT
+          else
+            echo "SIGN_062: SPDX SBOM signing failed"
+            exit 1
+          fi
+
+          echo "PASS: Multi-artifact signing workflow completed"
+          echo "Signed artifacts:"
+          echo "  - Container image: $CONTAINER_TARGET"
+          echo "  - CycloneDX SBOM: $CYCLONEDX_SBOM"
+          echo "  - SPDX SBOM: $SPDX_SBOM"
+
+      - name: Verify SBOM signatures
+        id: verify-sbom-signatures
+        run: |
+          echo "Verifying SBOM signatures with attestation type validation..."
+
+          CYCLONEDX_SBOM="sbom-cyclonedx.json"
+          SPDX_SBOM="sbom-spdx.json"
+
+          # Verify CycloneDX SBOM signature
+          echo "Verifying CycloneDX SBOM signature..."
+          if cosign verify-blob \
+              --certificate-identity="$OIDC_SUBJECT" \
+              --certificate-oidc-issuer="$OIDC_ISSUER" \
+              --bundle="$CYCLONEDX_SBOM.bundle" \
+              "$CYCLONEDX_SBOM"; then
+            echo "PASS: CycloneDX SBOM signature verified"
+            echo "cyclonedx_verified=true" >> $GITHUB_OUTPUT
+          else
+            echo "SIGN_063: CycloneDX SBOM signature verification failed"
+            exit 1
+          fi
+
+          # Verify SPDX SBOM signature
+          echo "Verifying SPDX SBOM signature..."
+          if cosign verify-blob \
+              --certificate-identity="$OIDC_SUBJECT" \
+              --certificate-oidc-issuer="$OIDC_ISSUER" \
+              --bundle="$SPDX_SBOM.bundle" \
+              "$SPDX_SBOM"; then
+            echo "PASS: SPDX SBOM signature verified"
+            echo "spdx_verified=true" >> $GITHUB_OUTPUT
+          else
+            echo "SIGN_064: SPDX SBOM signature verification failed"
+            exit 1
+          fi
+
+          echo "PASS: End-to-end SBOM signing and verification workflow completed"
+
+      - name: Upload signed SBOM artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: signed-sbom-artifacts
+          path: |
+            sbom-cyclonedx.json
+            sbom-cyclonedx.json.bundle
+            sbom-spdx.json
+            sbom-spdx.json.bundle
+          retention-days: 30
+
+      - name: Comprehensive error handling and monitoring
+        id: error-handling
+        if: always()
+        run: |
+          echo "Implementing comprehensive error handling with error taxonomy..."
+
+          # Initialize error tracking
+          ERROR_COUNT=0
+          ERROR_REPORT=""
+          SEVERITY_CRITICAL=0
+          SEVERITY_HIGH=0
+          SEVERITY_MEDIUM=0
+
+          # Check each signing component
+          echo "Analyzing signing workflow results..."
+
+          # Check Cosign installation
+          if [[ "${{ steps.install-cosign.outcome }}" != "success" ]]; then
+            ERROR_COUNT=$((ERROR_COUNT + 1))
+            SEVERITY_CRITICAL=$((SEVERITY_CRITICAL + 1))
+            ERROR_REPORT+="\nSIGN_011: Cosign CLI installation failed - CRITICAL"
+          fi
+
+          # Check OIDC token configuration
+          if [[ "${{ steps.test-oidc.outcome }}" != "success" ]]; then
+            ERROR_COUNT=$((ERROR_COUNT + 1))
+            SEVERITY_CRITICAL=$((SEVERITY_CRITICAL + 1))
+            ERROR_REPORT+="\nSIGN_001-006: OIDC token configuration failed - CRITICAL"
+          fi
+
+          # Check container signing
+          if [[ "${{ steps.keyless-signing.outputs.container_signed }}" != "true" ]]; then
+            ERROR_COUNT=$((ERROR_COUNT + 1))
+            SEVERITY_HIGH=$((SEVERITY_HIGH + 1))
+            ERROR_REPORT+="\nSIGN_031: Container image signing failed - HIGH"
+          fi
+
+          # Check signature verification
+          if [[ "${{ steps.verify-signature.outputs.signature_verified }}" != "true" ]]; then
+            ERROR_COUNT=$((ERROR_COUNT + 1))
+            SEVERITY_HIGH=$((SEVERITY_HIGH + 1))
+            ERROR_REPORT+="\nSIGN_051: Container signature verification failed - HIGH"
+          fi
+
+          # Check Rekor integration
+          if [[ "${{ steps.rekor-verification.outputs.rekor_verified }}" != "true" ]]; then
+            ERROR_COUNT=$((ERROR_COUNT + 1))
+            SEVERITY_HIGH=$((SEVERITY_HIGH + 1))
+            ERROR_REPORT+="\nSIGN_041-044: Rekor transparency log integration failed - HIGH"
+          fi
+
+          # Check SBOM signing
+          if [[ "${{ steps.sbom-signing.outputs.cyclonedx_signed }}" != "true" ]]; then
+            ERROR_COUNT=$((ERROR_COUNT + 1))
+            SEVERITY_MEDIUM=$((SEVERITY_MEDIUM + 1))
+            ERROR_REPORT+="\nSIGN_061: CycloneDX SBOM signing failed - MEDIUM"
+          fi
+
+          if [[ "${{ steps.sbom-signing.outputs.spdx_signed }}" != "true" ]]; then
+            ERROR_COUNT=$((ERROR_COUNT + 1))
+            SEVERITY_MEDIUM=$((SEVERITY_MEDIUM + 1))
+            ERROR_REPORT+="\nSIGN_062: SPDX SBOM signing failed - MEDIUM"
+          fi
+
+          # Collect diagnostic information
+          echo "Collecting diagnostic information..."
+
+          DIAGNOSTIC_INFO="# Keyless Signing Diagnostic Report\n"
+          DIAGNOSTIC_INFO+="Generated: $(date -u +'%Y-%m-%dT%H:%M:%SZ')\n"
+          DIAGNOSTIC_INFO+="Workflow: ${{ github.workflow }}\n"
+          DIAGNOSTIC_INFO+="Run ID: ${{ github.run_id }}\n"
+          DIAGNOSTIC_INFO+="Commit: ${{ github.sha }}\n"
+          DIAGNOSTIC_INFO+="Actor: ${{ github.actor }}\n"
+          DIAGNOSTIC_INFO+="Repository: ${{ github.repository }}\n\n"
+
+          DIAGNOSTIC_INFO+="## Error Summary\n"
+          DIAGNOSTIC_INFO+="Total Errors: $ERROR_COUNT\n"
+          DIAGNOSTIC_INFO+="Critical: $SEVERITY_CRITICAL\n"
+          DIAGNOSTIC_INFO+="High: $SEVERITY_HIGH\n"
+          DIAGNOSTIC_INFO+="Medium: $SEVERITY_MEDIUM\n\n"
+
+          if [[ $ERROR_COUNT -gt 0 ]]; then
+            DIAGNOSTIC_INFO+="## Error Details\n"
+            DIAGNOSTIC_INFO+="$ERROR_REPORT\n\n"
+          fi
+
+          DIAGNOSTIC_INFO+="## Component Status\n"
+          DIAGNOSTIC_INFO+="- Cosign Installation: ${{ steps.install-cosign.outcome }}\n"
+          DIAGNOSTIC_INFO+="- OIDC Configuration: ${{ steps.test-oidc.outcome }}\n"
+          DIAGNOSTIC_INFO+="- Container Signing: ${{ steps.keyless-signing.outcome }}\n"
+          DIAGNOSTIC_INFO+="- Signature Verification: ${{ steps.verify-signature.outcome }}\n"
+          DIAGNOSTIC_INFO+="- Rekor Integration: ${{ steps.rekor-verification.outcome }}\n"
+          DIAGNOSTIC_INFO+="- SBOM Signing: ${{ steps.sbom-signing.outcome }}\n"
+          DIAGNOSTIC_INFO+="- SBOM Verification: ${{ steps.verify-sbom-signatures.outcome }}\n\n"
+
+          DIAGNOSTIC_INFO+="## Configuration Details\n"
+          DIAGNOSTIC_INFO+="- Cosign Version: $(cosign version --json 2>/dev/null | jq -r '.gitVersion' || 'N/A')\n"
+          DIAGNOSTIC_INFO+="- OIDC Issuer: $OIDC_ISSUER\n"
+          DIAGNOSTIC_INFO+="- OIDC Subject: $OIDC_SUBJECT\n"
+          DIAGNOSTIC_INFO+="- Rekor URL: $REKOR_URL\n"
+
+          # Save diagnostic report
+          echo -e "$DIAGNOSTIC_INFO" > keyless-signing-diagnostic.md
+
+          # Output results
+          echo "error_count=$ERROR_COUNT" >> $GITHUB_OUTPUT
+          echo "severity_critical=$SEVERITY_CRITICAL" >> $GITHUB_OUTPUT
+          echo "severity_high=$SEVERITY_HIGH" >> $GITHUB_OUTPUT
+          echo "severity_medium=$SEVERITY_MEDIUM" >> $GITHUB_OUTPUT
+
+          # Add to GitHub step summary
+          {
+            echo "# Keyless Signing Workflow Results"
+            echo ""
+            echo "## Overall Status"
+            if [[ $ERROR_COUNT -eq 0 ]]; then
+              echo "✅ **SUCCESS**: All keyless signing operations completed successfully"
+            elif [[ $SEVERITY_CRITICAL -gt 0 ]]; then
+              echo "❌ **FAILED**: Critical errors detected in signing workflow"
+            elif [[ $SEVERITY_HIGH -gt 0 ]]; then
+              echo "⚠️ **PARTIAL**: High severity issues detected"
+            else
+              echo "⚠️ **WARNING**: Medium severity issues detected"
+            fi
+            echo ""
+            echo "## Error Summary"
+            echo "| Severity | Count |"
+            echo "|----------|-------|"
+            echo "| Critical | $SEVERITY_CRITICAL |"
+            echo "| High | $SEVERITY_HIGH |"
+            echo "| Medium | $SEVERITY_MEDIUM |"
+            echo "| **Total** | **$ERROR_COUNT** |"
+            echo ""
+            echo "## Component Results"
+            echo "| Component | Status | Result |"
+            echo "|-----------|--------|--------|"
+            echo "| Cosign Installation | ${{ steps.install-cosign.outcome }} | $([ '${{ steps.install-cosign.outcome }}' = 'success' ] && echo '✅' || echo '❌') |"
+            echo "| OIDC Configuration | ${{ steps.test-oidc.outcome }} | $([ '${{ steps.test-oidc.outcome }}' = 'success' ] && echo '✅' || echo '❌') |"
+            echo "| Container Signing | ${{ steps.keyless-signing.outcome }} | $([ '${{ steps.keyless-signing.outcome }}' = 'success' ] && echo '✅' || echo '❌') |"
+            echo "| Signature Verification | ${{ steps.verify-signature.outcome }} | $([ '${{ steps.verify-signature.outcome }}' = 'success' ] && echo '✅' || echo '❌') |"
+            echo "| Rekor Integration | ${{ steps.rekor-verification.outcome }} | $([ '${{ steps.rekor-verification.outcome }}' = 'success' ] && echo '✅' || echo '❌') |"
+            echo "| SBOM Signing | ${{ steps.sbom-signing.outcome }} | $([ '${{ steps.sbom-signing.outcome }}' = 'success' ] && echo '✅' || echo '❌') |"
+            echo "| SBOM Verification | ${{ steps.verify-sbom-signatures.outcome }} | $([ '${{ steps.verify-sbom-signatures.outcome }}' = 'success' ] && echo '✅' || echo '❌') |"
+
+            if [[ $ERROR_COUNT -gt 0 ]]; then
+              echo ""
+              echo "## Error Details"
+              echo -e "$ERROR_REPORT"
+            fi
+
+            echo ""
+            echo "## Artifacts"
+            echo "- [Diagnostic Report](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) (keyless-signing-diagnostic artifact)"
+            echo "- [Signed SBOMs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) (signed-sbom-artifacts artifact)"
+
+          } >> $GITHUB_STEP_SUMMARY
+
+          # Determine workflow exit status
+          if [[ $SEVERITY_CRITICAL -gt 0 ]]; then
+            echo "CRITICAL errors detected - failing workflow"
+            exit 1
+          elif [[ $SEVERITY_HIGH -gt 0 ]]; then
+            echo "HIGH severity issues detected - workflow will continue with warnings"
+          else
+            echo "Keyless signing workflow completed successfully"
+          fi
+
+      - name: Upload diagnostic report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: keyless-signing-diagnostic
+          path: keyless-signing-diagnostic.md
+          retention-days: 30
