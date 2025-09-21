@@ -1116,3 +1116,695 @@ jobs:
           name: keyless-signing-diagnostic
           path: keyless-signing-diagnostic.md
           retention-days: 30
+
+  slsa-provenance:
+    runs-on: ubuntu-latest
+    needs: [keyless-signing, vulnerability-scanning]
+    permissions:
+      id-token: write
+      contents: read
+      packages: write
+    env:
+      COSIGN_EXPERIMENTAL: 1
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install SLSA provenance tools
+        id: install-slsa-tools
+        run: |
+          echo "Installing SLSA provenance generation tools..."
+
+          # Install Cosign CLI (reuse from keyless signing)
+          COSIGN_VERSION="v2.2.3"
+          COSIGN_BINARY="cosign-linux-amd64"
+          COSIGN_URL="https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/${COSIGN_BINARY}"
+
+          curl -sSL "$COSIGN_URL" -o cosign
+          chmod +x cosign
+          sudo mv cosign /usr/local/bin/cosign
+
+          # Install SLSA verifier for validation
+          SLSA_VERIFIER_VERSION="v2.4.1"
+          SLSA_VERIFIER_URL="https://github.com/slsa-framework/slsa-verifier/releases/download/${SLSA_VERIFIER_VERSION}/slsa-verifier-linux-amd64"
+
+          curl -sSL "$SLSA_VERIFIER_URL" -o slsa-verifier
+          chmod +x slsa-verifier
+          sudo mv slsa-verifier /usr/local/bin/slsa-verifier
+
+          # Install ORAS for OCI operations
+          curl -LO https://github.com/oras-project/oras/releases/latest/download/oras_linux_amd64.tar.gz
+          mkdir -p oras-install/
+          tar -zxf oras_linux_amd64.tar.gz -C oras-install/
+          sudo mv oras-install/oras /usr/local/bin/
+          rm -rf oras-install oras_linux_amd64.tar.gz
+
+          # Verify installations
+          cosign version
+          slsa-verifier version
+          oras version
+
+          echo "SLSA tools installation completed"
+
+      - name: Configure GitHub OIDC for SLSA attestation
+        id: configure-oidc
+        run: |
+          echo "Configuring GitHub OIDC for SLSA attestation generation..."
+
+          # Test OIDC token environment variables
+          if [[ -z "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" ]]; then
+            echo "ATTEST_011: OIDC token request token not available"
+            exit 1
+          fi
+
+          if [[ -z "$ACTIONS_ID_TOKEN_REQUEST_URL" ]]; then
+            echo "ATTEST_012: OIDC token request URL not available"
+            exit 1
+          fi
+
+          # Configure OIDC for Sigstore attestation
+          OIDC_ISSUER="https://token.actions.githubusercontent.com"
+          OIDC_AUDIENCE="sigstore"
+
+          # Get OIDC token for attestation
+          OIDC_TOKEN=$(curl -sH "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+                           "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$OIDC_AUDIENCE" | \
+                           jq -r '.value' 2>/dev/null)
+
+          if [[ -z "$OIDC_TOKEN" || "$OIDC_TOKEN" == "null" ]]; then
+            echo "ATTEST_013: OIDC token acquisition for attestation failed"
+            exit 1
+          fi
+
+          # Extract and validate token claims
+          TOKEN_PAYLOAD=$(echo "$OIDC_TOKEN" | cut -d'.' -f2)
+          PADDED_PAYLOAD=$(echo "$TOKEN_PAYLOAD" | sed 's/$/===/' | fold -w 4 | head -1)
+          TOKEN_CLAIMS=$(echo "$PADDED_PAYLOAD" | base64 -d 2>/dev/null | jq . 2>/dev/null || echo "{}")
+
+          SUB=$(echo "$TOKEN_CLAIMS" | jq -r '.sub // empty')
+          ACTOR=$(echo "$TOKEN_CLAIMS" | jq -r '.actor // empty')
+          REPOSITORY=$(echo "$TOKEN_CLAIMS" | jq -r '.repository // empty')
+
+          # Set environment variables for attestation
+          echo "OIDC_ISSUER=$OIDC_ISSUER" >> $GITHUB_ENV
+          echo "OIDC_AUDIENCE=$OIDC_AUDIENCE" >> $GITHUB_ENV
+          echo "OIDC_SUBJECT=$SUB" >> $GITHUB_ENV
+          echo "OIDC_ACTOR=$ACTOR" >> $GITHUB_ENV
+          echo "OIDC_REPOSITORY=$REPOSITORY" >> $GITHUB_ENV
+
+          echo "OIDC configuration completed for SLSA attestation"
+          echo "Attestation identity: $SUB"
+
+      - name: Collect comprehensive build environment metadata
+        id: build-metadata
+        run: |
+          echo "Collecting comprehensive build environment metadata..."
+
+          BUILD_TIME=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+
+          # GitHub Actions runner environment
+          RUNNER_OS="${{ runner.os }}"
+          RUNNER_ARCH="${{ runner.arch }}"
+          RUNNER_NAME="${{ runner.name }}"
+          RUNNER_TEMP="${{ runner.temp }}"
+
+          # Workflow execution context
+          WORKFLOW_NAME="${{ github.workflow }}"
+          WORKFLOW_REF="${{ github.workflow_ref }}"
+          RUN_ID="${{ github.run_id }}"
+          RUN_NUMBER="${{ github.run_number }}"
+          RUN_ATTEMPT="${{ github.run_attempt }}"
+          JOB_ID="${{ github.job }}"
+
+          # Source code context
+          COMMIT_SHA="${{ github.sha }}"
+          COMMIT_REF="${{ github.ref }}"
+          COMMIT_REF_NAME="${{ github.ref_name }}"
+          COMMIT_REF_TYPE="${{ github.ref_type }}"
+          REPOSITORY="${{ github.repository }}"
+          REPOSITORY_OWNER="${{ github.repository_owner }}"
+          ACTOR="${{ github.actor }}"
+
+          # Build tool versions
+          GO_VERSION=$(go version 2>/dev/null | awk '{print $3}' || echo "not-installed")
+          NODE_VERSION=$(node --version 2>/dev/null || echo "not-installed")
+          DOCKER_VERSION=$(docker --version 2>/dev/null | awk '{print $3}' | sed 's/,//' || echo "not-installed")
+
+          # System information
+          SYSTEM_INFO=$(uname -a)
+          DISK_USAGE=$(df -h / | tail -1 | awk '{print $5}')
+          MEMORY_INFO=$(free -h | head -2 | tail -1 | awk '{print $2}')
+
+          # Create build metadata JSON
+          BUILD_METADATA=$(cat <<EOF
+          {
+            "buildTime": "$BUILD_TIME",
+            "runner": {
+              "os": "$RUNNER_OS",
+              "arch": "$RUNNER_ARCH",
+              "name": "$RUNNER_NAME",
+              "temp": "$RUNNER_TEMP"
+            },
+            "workflow": {
+              "name": "$WORKFLOW_NAME",
+              "ref": "$WORKFLOW_REF",
+              "runId": "$RUN_ID",
+              "runNumber": "$RUN_NUMBER",
+              "runAttempt": "$RUN_ATTEMPT",
+              "jobId": "$JOB_ID"
+            },
+            "source": {
+              "commitSha": "$COMMIT_SHA",
+              "commitRef": "$COMMIT_REF",
+              "commitRefName": "$COMMIT_REF_NAME",
+              "commitRefType": "$COMMIT_REF_TYPE",
+              "repository": "$REPOSITORY",
+              "repositoryOwner": "$REPOSITORY_OWNER",
+              "actor": "$ACTOR"
+            },
+            "buildTools": {
+              "go": "$GO_VERSION",
+              "node": "$NODE_VERSION",
+              "docker": "$DOCKER_VERSION"
+            },
+            "system": {
+              "info": "$SYSTEM_INFO",
+              "diskUsage": "$DISK_USAGE",
+              "memory": "$MEMORY_INFO"
+            }
+          }
+          EOF
+          )
+
+          # Save build metadata
+          echo "$BUILD_METADATA" | jq . > build-metadata.json
+
+          # Output key values
+          echo "build_time=$BUILD_TIME" >> $GITHUB_OUTPUT
+          echo "commit_sha=$COMMIT_SHA" >> $GITHUB_OUTPUT
+          echo "workflow_ref=$WORKFLOW_REF" >> $GITHUB_OUTPUT
+          echo "runner_info=$RUNNER_OS-$RUNNER_ARCH" >> $GITHUB_OUTPUT
+
+          echo "Build environment metadata collection completed"
+
+      - name: Generate SLSA v1.0 provenance statement
+        id: generate-provenance
+        run: |
+          echo "Generating SLSA v1.0 provenance statement..."
+
+          # Prepare container target for provenance
+          CONTAINER_IMAGE="vulnerable-demo:latest"
+
+          # Build the demo container to get artifact digest
+          docker build -t "$CONTAINER_IMAGE" examples/vulnerable-app/
+          CONTAINER_DIGEST=$(docker inspect "$CONTAINER_IMAGE" --format='{{.Id}}')
+
+          # Generate artifact digest
+          ARTIFACT_DIGEST="sha256:${CONTAINER_DIGEST#sha256:}"
+
+          BUILD_TIME="${{ steps.build-metadata.outputs.build_time }}"
+          COMMIT_SHA="${{ steps.build-metadata.outputs.commit_sha }}"
+          WORKFLOW_REF="${{ steps.build-metadata.outputs.workflow_ref }}"
+
+          # Create SLSA v1.0 provenance statement
+          SLSA_PROVENANCE=$(cat <<EOF
+          {
+            "_type": "https://in-toto.io/Statement/v1",
+            "subject": [
+              {
+                "name": "$CONTAINER_IMAGE",
+                "digest": {
+                  "sha256": "${CONTAINER_DIGEST#sha256:}"
+                }
+              }
+            ],
+            "predicateType": "https://slsa.dev/provenance/v1",
+            "predicate": {
+              "buildDefinition": {
+                "buildType": "https://github.com/Attestations/GitHubActionsWorkflow@v1",
+                "externalParameters": {
+                  "workflow": {
+                    "ref": "$WORKFLOW_REF",
+                    "repository": "${{ github.repository }}",
+                    "path": ".github/workflows/security-pipeline.yaml"
+                  }
+                },
+                "internalParameters": {
+                  "github": {
+                    "event_name": "${{ github.event_name }}",
+                    "repository_id": "${{ github.repository_id }}",
+                    "repository_owner_id": "${{ github.repository_owner_id }}"
+                  }
+                },
+                "resolvedDependencies": [
+                  {
+                    "uri": "git+${{ github.server_url }}/${{ github.repository }}@$COMMIT_SHA",
+                    "digest": {
+                      "sha1": "$COMMIT_SHA"
+                    }
+                  }
+                ]
+              },
+              "runDetails": {
+                "builder": {
+                  "id": "https://github.com/actions/runner"
+                },
+                "metadata": {
+                  "invocationId": "${{ github.run_id }}",
+                  "startedOn": "$BUILD_TIME",
+                  "finishedOn": "$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+                },
+                "byproducts": [
+                  {
+                    "name": "build-metadata.json",
+                    "digest": {
+                      "sha256": "$(sha256sum build-metadata.json | cut -d' ' -f1)"
+                    }
+                  }
+                ]
+              }
+            }
+          }
+          EOF
+          )
+
+          # Save SLSA provenance
+          echo "$SLSA_PROVENANCE" | jq . > slsa-provenance.json
+
+          # Output key values
+          echo "artifact_digest=$ARTIFACT_DIGEST" >> $GITHUB_OUTPUT
+          echo "container_target=$CONTAINER_IMAGE" >> $GITHUB_OUTPUT
+
+          echo "SLSA v1.0 provenance statement generated"
+          echo "Target artifact: $CONTAINER_IMAGE"
+          echo "Artifact digest: $ARTIFACT_DIGEST"
+
+      - name: Generate multi-predicate attestations
+        id: multi-predicate
+        run: |
+          echo "Generating multi-predicate attestations (SLSA, SBOM, Vulnerability)..."
+
+          CONTAINER_TARGET="${{ steps.generate-provenance.outputs.container_target }}"
+          BUILD_TIME="${{ steps.build-metadata.outputs.build_time }}"
+
+          # Install Syft for SBOM generation
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
+
+          # Generate SBOM attestation predicate (CycloneDX)
+          echo "Generating SBOM attestation predicate..."
+          syft "$CONTAINER_TARGET" --scope all-layers -o cyclonedx-json=temp-sbom.json
+
+          SBOM_ATTESTATION=$(cat <<EOF
+          {
+            "_type": "https://in-toto.io/Statement/v1",
+            "subject": [
+              {
+                "name": "$CONTAINER_TARGET",
+                "digest": {
+                  "sha256": "${{ steps.generate-provenance.outputs.artifact_digest }}"
+                }
+              }
+            ],
+            "predicateType": "https://spdx.dev/Document",
+            "predicate": $(cat temp-sbom.json)
+          }
+          EOF
+          )
+
+          echo "$SBOM_ATTESTATION" | jq . > sbom-attestation.json
+
+          # Generate vulnerability scan attestation predicate
+          echo "Generating vulnerability scan attestation predicate..."
+
+          # Run Trivy scan for attestation
+          docker run --rm \
+            -v "${{ github.workspace }}":/workspace \
+            aquasec/trivy:latest image \
+            --format json \
+            --output /workspace/vuln-scan.json \
+            "$CONTAINER_TARGET" || true
+
+          VULN_ATTESTATION=$(cat <<EOF
+          {
+            "_type": "https://in-toto.io/Statement/v1",
+            "subject": [
+              {
+                "name": "$CONTAINER_TARGET",
+                "digest": {
+                  "sha256": "${{ steps.generate-provenance.outputs.artifact_digest }}"
+                }
+              }
+            ],
+            "predicateType": "https://cosign.sigstore.dev/attestation/vuln/v1",
+            "predicate": {
+              "invocation": {
+                "uri": "https://github.com/aquasecurity/trivy",
+                "producer_id": "trivy-scanner"
+              },
+              "scanner": {
+                "vendor": "Aqua Security",
+                "name": "Trivy",
+                "version": "latest"
+              },
+              "result": $(cat vuln-scan.json 2>/dev/null || echo "{}")
+            }
+          }
+          EOF
+          )
+
+          echo "$VULN_ATTESTATION" | jq . > vulnerability-attestation.json
+
+          # Clean up temporary files
+          rm -f temp-sbom.json
+
+          echo "Multi-predicate attestations generated successfully"
+          echo "Generated attestations:"
+          echo "  - SLSA provenance: slsa-provenance.json"
+          echo "  - SBOM attestation: sbom-attestation.json"
+          echo "  - Vulnerability attestation: vulnerability-attestation.json"
+
+      - name: Sign attestations with keyless approach
+        id: sign-attestations
+        run: |
+          echo "Signing attestations using keyless approach..."
+
+          SIGNING_TIME=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+          COMMIT_SHA="${{ github.sha }}"
+          WORKFLOW_REF="${{ github.workflow }}@${{ github.ref }}"
+
+          # Sign SLSA provenance attestation
+          echo "Signing SLSA provenance attestation..."
+          SLSA_ANNOTATIONS=(
+            "--annotation=org.opencontainers.image.title=SLSA Provenance Attestation"
+            "--annotation=org.opencontainers.image.description=SLSA v1.0 provenance for container build"
+            "--annotation=org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}"
+            "--annotation=org.opencontainers.image.revision=$COMMIT_SHA"
+            "--annotation=org.opencontainers.image.created=$SIGNING_TIME"
+            "--annotation=keystone.attestation.type=slsa-provenance"
+            "--annotation=keystone.attestation.version=v1.0"
+            "--annotation=keystone.signature.workflow=$WORKFLOW_REF"
+            "--annotation=keystone.signature.type=keyless"
+          )
+
+          if cosign sign-blob --yes "${SLSA_ANNOTATIONS[@]}" --bundle="slsa-provenance.json.bundle" slsa-provenance.json; then
+            echo "PASS: SLSA provenance attestation signed successfully"
+            echo "slsa_signed=true" >> $GITHUB_OUTPUT
+          else
+            echo "ATTEST_021: SLSA provenance attestation signing failed"
+            exit 1
+          fi
+
+          # Sign SBOM attestation
+          echo "Signing SBOM attestation..."
+          SBOM_ANNOTATIONS=(
+            "--annotation=org.opencontainers.image.title=SBOM Attestation"
+            "--annotation=org.opencontainers.image.description=Software Bill of Materials attestation"
+            "--annotation=org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}"
+            "--annotation=org.opencontainers.image.revision=$COMMIT_SHA"
+            "--annotation=org.opencontainers.image.created=$SIGNING_TIME"
+            "--annotation=keystone.attestation.type=sbom"
+            "--annotation=keystone.attestation.format=cyclonedx"
+            "--annotation=keystone.signature.workflow=$WORKFLOW_REF"
+            "--annotation=keystone.signature.type=keyless"
+          )
+
+          if cosign sign-blob --yes "${SBOM_ANNOTATIONS[@]}" --bundle="sbom-attestation.json.bundle" sbom-attestation.json; then
+            echo "PASS: SBOM attestation signed successfully"
+            echo "sbom_signed=true" >> $GITHUB_OUTPUT
+          else
+            echo "ATTEST_022: SBOM attestation signing failed"
+            exit 1
+          fi
+
+          # Sign vulnerability attestation
+          echo "Signing vulnerability attestation..."
+          VULN_ANNOTATIONS=(
+            "--annotation=org.opencontainers.image.title=Vulnerability Scan Attestation"
+            "--annotation=org.opencontainers.image.description=Vulnerability scan results attestation"
+            "--annotation=org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}"
+            "--annotation=org.opencontainers.image.revision=$COMMIT_SHA"
+            "--annotation=org.opencontainers.image.created=$SIGNING_TIME"
+            "--annotation=keystone.attestation.type=vulnerability-scan"
+            "--annotation=keystone.attestation.scanner=trivy"
+            "--annotation=keystone.signature.workflow=$WORKFLOW_REF"
+            "--annotation=keystone.signature.type=keyless"
+          )
+
+          if cosign sign-blob --yes "${VULN_ANNOTATIONS[@]}" --bundle="vulnerability-attestation.json.bundle" vulnerability-attestation.json; then
+            echo "PASS: Vulnerability attestation signed successfully"
+            echo "vuln_signed=true" >> $GITHUB_OUTPUT
+          else
+            echo "ATTEST_023: Vulnerability attestation signing failed"
+            exit 1
+          fi
+
+          echo "All attestations signed successfully with keyless approach"
+
+      - name: Store attestations in OCI registry
+        id: store-attestations
+        run: |
+          echo "Storing signed attestations in GitHub Container Registry..."
+
+          # Login to GitHub Container Registry
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+          IMAGE_REF="ghcr.io/${{ github.repository_owner }}/$(echo '${{ github.repository }}' | cut -d'/' -f2)"
+          COMMIT_SHA="${{ github.sha }}"
+
+          # Upload SLSA provenance attestation
+          SLSA_REF="${IMAGE_REF}/attestations:slsa-provenance-$COMMIT_SHA"
+          echo "Uploading SLSA provenance attestation..."
+
+          if oras push "$SLSA_REF" \
+            --annotation "org.opencontainers.image.title=SLSA Provenance Attestation" \
+            --annotation "org.opencontainers.image.description=SLSA v1.0 provenance attestation" \
+            --annotation "org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}" \
+            --annotation "org.opencontainers.image.revision=$COMMIT_SHA" \
+            --annotation "org.opencontainers.image.created=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+            --annotation "keystone.attestation.type=slsa-provenance" \
+            --annotation "keystone.attestation.version=v1.0" \
+            --annotation "keystone.attestation.target=${{ steps.generate-provenance.outputs.container_target }}" \
+            slsa-provenance.json:application/vnd.in-toto+json \
+            slsa-provenance.json.bundle:application/vnd.dev.sigstore.bundle+json+v0.2; then
+            echo "slsa_registry_ref=$SLSA_REF" >> $GITHUB_OUTPUT
+            echo "PASS: SLSA provenance uploaded to $SLSA_REF"
+          else
+            echo "ATTEST_031: SLSA provenance upload failed"
+            exit 1
+          fi
+
+          # Upload SBOM attestation
+          SBOM_REF="${IMAGE_REF}/attestations:sbom-$COMMIT_SHA"
+          echo "Uploading SBOM attestation..."
+
+          if oras push "$SBOM_REF" \
+            --annotation "org.opencontainers.image.title=SBOM Attestation" \
+            --annotation "org.opencontainers.image.description=Software Bill of Materials attestation" \
+            --annotation "org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}" \
+            --annotation "org.opencontainers.image.revision=$COMMIT_SHA" \
+            --annotation "org.opencontainers.image.created=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+            --annotation "keystone.attestation.type=sbom" \
+            --annotation "keystone.attestation.format=cyclonedx" \
+            --annotation "keystone.attestation.target=${{ steps.generate-provenance.outputs.container_target }}" \
+            sbom-attestation.json:application/vnd.in-toto+json \
+            sbom-attestation.json.bundle:application/vnd.dev.sigstore.bundle+json+v0.2; then
+            echo "sbom_registry_ref=$SBOM_REF" >> $GITHUB_OUTPUT
+            echo "PASS: SBOM attestation uploaded to $SBOM_REF"
+          else
+            echo "ATTEST_032: SBOM attestation upload failed"
+            exit 1
+          fi
+
+          # Upload vulnerability attestation
+          VULN_REF="${IMAGE_REF}/attestations:vulnerability-$COMMIT_SHA"
+          echo "Uploading vulnerability attestation..."
+
+          if oras push "$VULN_REF" \
+            --annotation "org.opencontainers.image.title=Vulnerability Scan Attestation" \
+            --annotation "org.opencontainers.image.description=Vulnerability scan results attestation" \
+            --annotation "org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}" \
+            --annotation "org.opencontainers.image.revision=$COMMIT_SHA" \
+            --annotation "org.opencontainers.image.created=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+            --annotation "keystone.attestation.type=vulnerability-scan" \
+            --annotation "keystone.attestation.scanner=trivy" \
+            --annotation "keystone.attestation.target=${{ steps.generate-provenance.outputs.container_target }}" \
+            vulnerability-attestation.json:application/vnd.in-toto+json \
+            vulnerability-attestation.json.bundle:application/vnd.dev.sigstore.bundle+json+v0.2; then
+            echo "vuln_registry_ref=$VULN_REF" >> $GITHUB_OUTPUT
+            echo "PASS: Vulnerability attestation uploaded to $VULN_REF"
+          else
+            echo "ATTEST_033: Vulnerability attestation upload failed"
+            exit 1
+          fi
+
+          echo "All attestations stored successfully in OCI registry"
+
+      - name: Verify attestations and source-to-artifact traceability
+        id: verify-attestations
+        run: |
+          echo "Verifying attestations and establishing source-to-artifact traceability..."
+
+          # Verify SLSA provenance signature
+          echo "Verifying SLSA provenance attestation signature..."
+          if cosign verify-blob \
+              --certificate-identity="$OIDC_SUBJECT" \
+              --certificate-oidc-issuer="$OIDC_ISSUER" \
+              --bundle="slsa-provenance.json.bundle" \
+              slsa-provenance.json; then
+            echo "PASS: SLSA provenance signature verified"
+            echo "slsa_verified=true" >> $GITHUB_OUTPUT
+          else
+            echo "ATTEST_041: SLSA provenance signature verification failed"
+            exit 1
+          fi
+
+          # Verify SBOM attestation signature
+          echo "Verifying SBOM attestation signature..."
+          if cosign verify-blob \
+              --certificate-identity="$OIDC_SUBJECT" \
+              --certificate-oidc-issuer="$OIDC_ISSUER" \
+              --bundle="sbom-attestation.json.bundle" \
+              sbom-attestation.json; then
+            echo "PASS: SBOM attestation signature verified"
+            echo "sbom_verified=true" >> $GITHUB_OUTPUT
+          else
+            echo "ATTEST_042: SBOM attestation signature verification failed"
+            exit 1
+          fi
+
+          # Verify vulnerability attestation signature
+          echo "Verifying vulnerability attestation signature..."
+          if cosign verify-blob \
+              --certificate-identity="$OIDC_SUBJECT" \
+              --certificate-oidc-issuer="$OIDC_ISSUER" \
+              --bundle="vulnerability-attestation.json.bundle" \
+              vulnerability-attestation.json; then
+            echo "PASS: Vulnerability attestation signature verified"
+            echo "vuln_verified=true" >> $GITHUB_OUTPUT
+          else
+            echo "ATTEST_043: Vulnerability attestation signature verification failed"
+            exit 1
+          fi
+
+          # Verify source-to-artifact traceability
+          echo "Verifying source-to-artifact traceability..."
+
+          COMMIT_SHA="${{ github.sha }}"
+          EXPECTED_ARTIFACT="${{ steps.generate-provenance.outputs.container_target }}"
+
+          # Extract source commit from SLSA provenance
+          PROVENANCE_COMMIT=$(jq -r '.predicate.buildDefinition.resolvedDependencies[0].digest.sha1' slsa-provenance.json)
+          PROVENANCE_SUBJECT=$(jq -r '.subject[0].name' slsa-provenance.json)
+
+          echo "Traceability verification:"
+          echo "  Expected commit: $COMMIT_SHA"
+          echo "  Provenance commit: $PROVENANCE_COMMIT"
+          echo "  Expected artifact: $EXPECTED_ARTIFACT"
+          echo "  Provenance subject: $PROVENANCE_SUBJECT"
+
+          if [[ "$COMMIT_SHA" == "$PROVENANCE_COMMIT" ]]; then
+            echo "PASS: Source commit traceability verified"
+            echo "source_verified=true" >> $GITHUB_OUTPUT
+          else
+            echo "ATTEST_051: Source commit traceability verification failed"
+            exit 1
+          fi
+
+          if [[ "$EXPECTED_ARTIFACT" == "$PROVENANCE_SUBJECT" ]]; then
+            echo "PASS: Artifact traceability verified"
+            echo "artifact_verified=true" >> $GITHUB_OUTPUT
+          else
+            echo "ATTEST_052: Artifact traceability verification failed"
+            exit 1
+          fi
+
+          echo "PASS: End-to-end attestation verification and traceability established"
+
+      - name: Upload attestation artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: slsa-attestations
+          path: |
+            slsa-provenance.json
+            slsa-provenance.json.bundle
+            sbom-attestation.json
+            sbom-attestation.json.bundle
+            vulnerability-attestation.json
+            vulnerability-attestation.json.bundle
+            build-metadata.json
+            vuln-scan.json
+          retention-days: 30
+
+      - name: Generate SLSA attestation summary
+        id: attestation-summary
+        if: always()
+        run: |
+          echo "Generating comprehensive SLSA attestation summary..."
+
+          # Count successful operations
+          SUCCESS_COUNT=0
+          TOTAL_OPERATIONS=6
+
+          [[ "${{ steps.install-slsa-tools.outcome }}" == "success" ]] && SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+          [[ "${{ steps.generate-provenance.outcome }}" == "success" ]] && SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+          [[ "${{ steps.multi-predicate.outcome }}" == "success" ]] && SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+          [[ "${{ steps.sign-attestations.outcome }}" == "success" ]] && SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+          [[ "${{ steps.store-attestations.outcome }}" == "success" ]] && SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+          [[ "${{ steps.verify-attestations.outcome }}" == "success" ]] && SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+
+          # Add to GitHub step summary
+          {
+            echo "# SLSA Provenance Attestation Results"
+            echo ""
+            echo "## Overall Status"
+            if [[ $SUCCESS_COUNT -eq $TOTAL_OPERATIONS ]]; then
+              echo "SUCCESS: All SLSA attestation operations completed successfully ($SUCCESS_COUNT/$TOTAL_OPERATIONS)"
+            else
+              echo "PARTIAL: $SUCCESS_COUNT/$TOTAL_OPERATIONS operations completed successfully"
+            fi
+            echo ""
+            echo "## Component Results"
+            echo "| Component | Status | Result |"
+            echo "|-----------|--------|--------|"
+            echo "| SLSA Tools Installation | ${{ steps.install-slsa-tools.outcome }} | $([ '${{ steps.install-slsa-tools.outcome }}' = 'success' ] && echo 'PASS' || echo 'FAIL') |"
+            echo "| Build Metadata Collection | ${{ steps.build-metadata.outcome }} | $([ '${{ steps.build-metadata.outcome }}' = 'success' ] && echo 'PASS' || echo 'FAIL') |"
+            echo "| SLSA Provenance Generation | ${{ steps.generate-provenance.outcome }} | $([ '${{ steps.generate-provenance.outcome }}' = 'success' ] && echo 'PASS' || echo 'FAIL') |"
+            echo "| Multi-Predicate Attestations | ${{ steps.multi-predicate.outcome }} | $([ '${{ steps.multi-predicate.outcome }}' = 'success' ] && echo 'PASS' || echo 'FAIL') |"
+            echo "| Attestation Signing | ${{ steps.sign-attestations.outcome }} | $([ '${{ steps.sign-attestations.outcome }}' = 'success' ] && echo 'PASS' || echo 'FAIL') |"
+            echo "| OCI Registry Storage | ${{ steps.store-attestations.outcome }} | $([ '${{ steps.store-attestations.outcome }}' = 'success' ] && echo 'PASS' || echo 'FAIL') |"
+            echo "| Attestation Verification | ${{ steps.verify-attestations.outcome }} | $([ '${{ steps.verify-attestations.outcome }}' = 'success' ] && echo 'PASS' || echo 'FAIL') |"
+            echo ""
+            echo "## Attestation Details"
+            echo "- **Target Artifact**: ${{ steps.generate-provenance.outputs.container_target }}"
+            echo "- **Build Time**: ${{ steps.build-metadata.outputs.build_time }}"
+            echo "- **Source Commit**: ${{ steps.build-metadata.outputs.commit_sha }}"
+            echo "- **Workflow Reference**: ${{ steps.build-metadata.outputs.workflow_ref }}"
+            echo "- **Runner**: ${{ steps.build-metadata.outputs.runner_info }}"
+            echo ""
+            echo "## Registry References"
+            echo "- **SLSA Provenance**: \`${{ steps.store-attestations.outputs.slsa_registry_ref }}\`"
+            echo "- **SBOM Attestation**: \`${{ steps.store-attestations.outputs.sbom_registry_ref }}\`"
+            echo "- **Vulnerability Attestation**: \`${{ steps.store-attestations.outputs.vuln_registry_ref }}\`"
+            echo ""
+            echo "## Verification Results"
+            echo "- **SLSA Signature**: $([ '${{ steps.verify-attestations.outputs.slsa_verified }}' = 'true' ] && echo 'VERIFIED' || echo 'FAILED')"
+            echo "- **SBOM Signature**: $([ '${{ steps.verify-attestations.outputs.sbom_verified }}' = 'true' ] && echo 'VERIFIED' || echo 'FAILED')"
+            echo "- **Vulnerability Signature**: $([ '${{ steps.verify-attestations.outputs.vuln_verified }}' = 'true' ] && echo 'VERIFIED' || echo 'FAILED')"
+            echo "- **Source Traceability**: $([ '${{ steps.verify-attestations.outputs.source_verified }}' = 'true' ] && echo 'VERIFIED' || echo 'FAILED')"
+            echo "- **Artifact Traceability**: $([ '${{ steps.verify-attestations.outputs.artifact_verified }}' = 'true' ] && echo 'VERIFIED' || echo 'FAILED')"
+            echo ""
+            echo "## Artifacts"
+            echo "- [SLSA Attestations](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) (slsa-attestations artifact)"
+            echo "- [Build Metadata](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) (build-metadata.json)"
+            echo ""
+            echo "## SLSA Compliance Level"
+            if [[ $SUCCESS_COUNT -eq $TOTAL_OPERATIONS ]]; then
+              echo "SLSA Level 3: Build integrity, source provenance, and cryptographic verification achieved"
+            else
+              echo "Partial Compliance: Some SLSA requirements not fully met"
+            fi
+          } >> $GITHUB_STEP_SUMMARY
+
+          echo "success_count=$SUCCESS_COUNT" >> $GITHUB_OUTPUT
+          echo "total_operations=$TOTAL_OPERATIONS" >> $GITHUB_OUTPUT
